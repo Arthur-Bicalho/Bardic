@@ -13,7 +13,7 @@ sharing one Rust core. See [`docs/design.md`](docs/design.md) for the full desig
 
 | Phase | Scope | State |
 |---|---|---|
-| 1 | Rust core: library DB, cue resolver, Spotify login (PKCE), Spotify client, playback engine, CLI | in progress |
+| 1 | Rust core: library DB, cue resolver, Spotify login (PKCE), Spotify client, playback engine, CLI | done (core + CLI; untested against live Spotify) |
 | 2 | Linux app (Tauri + TS), tray, hotkeys, MPRIS (C), layered local ambience | planned |
 | 3 | Android tablet app (Kotlin, UniFFI), layered local ambience | planned |
 | 4 | Polish: JSON campaign packs, LAN remote mode, App Remote SDK | planned |

@@ -145,6 +145,7 @@ impl BardicCore {
     /// Clears tokens locally and stops polling; call `start_polling` again after login.
     pub fn logout(&self) -> Result<()> {
         self.stop_polling();
+        self.engine.reset();
         self.auth.logout()
     }
 
