@@ -16,6 +16,11 @@ use crate::{BardicError, Result};
 
 pub const DEFAULT_API_BASE: &str = "https://api.spotify.com/v1";
 
+/// Largest `limit` Spotify's search endpoint accepts.
+pub const SEARCH_MAX_LIMIT: u8 = 50;
+/// Fallback `limit` when Spotify rejects a larger one with 400 (newer app quotas cap it lower).
+const SEARCH_FALLBACK_LIMIT: u8 = 10;
+
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -30,15 +35,24 @@ impl HttpSpotify {
     }
 
     /// For tests against wiremock: base without trailing slash, e.g. `http://127.0.0.1:1234/v1`.
+    ///
+    /// Panics if the HTTP client cannot be built; use [`Self::try_with_base_url`] to handle that.
     pub fn with_base_url(base_url: impl Into<String>) -> Self {
+        // The builder only fails when the TLS backend cannot initialise (pathological system
+        // setups). Falling back to `Client::new()` would silently drop our timeouts, so fail loudly.
+        Self::try_with_base_url(base_url).expect("reqwest client")
+    }
+
+    /// Fallible variant of [`Self::with_base_url`].
+    pub fn try_with_base_url(base_url: impl Into<String>) -> Result<Self> {
         let client = reqwest::Client::builder()
             .timeout(REQUEST_TIMEOUT)
             .connect_timeout(CONNECT_TIMEOUT)
             .user_agent(concat!("bardic-core/", env!("CARGO_PKG_VERSION")))
             .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+            .map_err(|e| BardicError::Network(e.without_url().to_string()))?;
         let base_url = base_url.into().trim_end_matches('/').to_string();
-        Self { client, base_url }
+        Ok(Self { client, base_url })
     }
 
     /// Send one request and return the (already status-checked) response.
@@ -52,7 +66,13 @@ impl HttpSpotify {
         body: Option<Value>,
     ) -> Result<reqwest::Response> {
         let url = format!("{}{}", self.base_url, path);
-        tracing::debug!(%method, %path, ?query, has_body = body.is_some(), "spotify request");
+        // Query values (e.g. search text) are user content: log only the parameter names.
+        tracing::debug!(
+            %method, %path,
+            query_keys = ?query.iter().map(|(k, _)| *k).collect::<Vec<_>>(),
+            has_body = body.is_some(),
+            "spotify request"
+        );
 
         let mut req = self.client.request(method.clone(), &url).header(AUTHORIZATION, format!("Bearer {token}"));
         if !query.is_empty() {
@@ -64,7 +84,8 @@ impl HttpSpotify {
             None => {}
         }
 
-        let resp = req.send().await?;
+        // reqwest errors embed the full URL (including the query); strip it.
+        let resp = req.send().await.map_err(|e| BardicError::from(e.without_url()))?;
         let status = resp.status();
         tracing::debug!(%path, status = status.as_u16(), "spotify response");
         if status.is_success() {
@@ -96,6 +117,17 @@ impl HttpSpotify {
     }
 }
 
+impl HttpSpotify {
+    async fn search_request(&self, token: &str, query: &str, limit: u8) -> Result<reqwest::Response> {
+        let q = [
+            ("q", query.to_string()),
+            ("type", "track,playlist,album".to_string()),
+            ("limit", limit.to_string()),
+        ];
+        self.send(Method::GET, "/search", token, &q, None).await
+    }
+}
+
 impl Default for HttpSpotify {
     fn default() -> Self {
         Self::new()
@@ -124,19 +156,48 @@ fn parse_error_body(text: &str) -> (String, Option<String>) {
     }
 }
 
+/// 403 `reason`s meaning "the command doesn't apply to the player's current state".
+const RESTRICTED_REASONS: &[&str] = &[
+    "ALREADY_PAUSED",
+    "NOT_PAUSED",
+    "NO_PREV_TRACK",
+    "NO_NEXT_TRACK",
+    "NO_SPECIFIC_TRACK",
+    "CONTEXT_DISALLOW",
+    "DISALLOWED",
+];
+
+/// Whether the body is a JSON document carrying an `error` member.
+fn has_json_error(body: &str) -> bool {
+    serde_json::from_str::<Value>(body).is_ok_and(|v| v.get("error").is_some())
+}
+
 /// The single place where HTTP failures become `BardicError`s.
 fn map_error(status: StatusCode, path: &str, retry_after: Option<u64>, body: &str) -> BardicError {
     let (message, reason) = parse_error_body(body);
     match status.as_u16() {
         401 => BardicError::NotAuthenticated,
-        403 => BardicError::Forbidden(if message.is_empty() { "forbidden".into() } else { message }),
+        403 => {
+            let reason_is = |r: &str| reason.as_deref().is_some_and(|x| x.eq_ignore_ascii_case(r));
+            let message = if message.is_empty() { "forbidden".to_string() } else { message };
+            let restricted = !reason_is("PREMIUM_REQUIRED")
+                && (RESTRICTED_REASONS.iter().any(|r| reason_is(r))
+                    || message.to_ascii_lowercase().contains("restriction violated"));
+            if restricted {
+                BardicError::Restricted(message)
+            } else {
+                BardicError::Forbidden(message)
+            }
+        }
         404 => {
             let mentions_device = reason.as_deref().is_some_and(|r| r.eq_ignore_ascii_case("NO_ACTIVE_DEVICE"))
                 || message.to_ascii_lowercase().contains("device");
-            if mentions_device || path.starts_with("/me/player") {
+            // Spotify sometimes answers a bare 404 (no JSON error) when there is no device.
+            let bare_player_404 = path.starts_with("/me/player") && !has_json_error(body);
+            if mentions_device || bare_player_404 {
                 BardicError::NoActiveDevice
             } else {
-                BardicError::Api { status: 404, message }
+                BardicError::NotFound(if message.is_empty() { "not found".into() } else { message })
             }
         }
         429 => BardicError::RateLimited { retry_after_secs: retry_after.unwrap_or(1) },
@@ -362,7 +423,7 @@ impl SpotifyApi for HttpSpotify {
         if resp.status() == StatusCode::NO_CONTENT {
             return Ok(None);
         }
-        let text = resp.text().await?;
+        let text = resp.text().await.map_err(|e| BardicError::from(e.without_url()))?;
         if text.trim().is_empty() {
             return Ok(None);
         }
@@ -372,7 +433,7 @@ impl SpotifyApi for HttpSpotify {
 
     async fn devices(&self, token: &str) -> Result<Vec<Device>> {
         let resp = self.send(Method::GET, "/me/player/devices", token, &[], None).await?;
-        let text = resp.text().await?;
+        let text = resp.text().await.map_err(|e| BardicError::from(e.without_url()))?;
         if text.trim().is_empty() {
             return Ok(Vec::new());
         }
@@ -442,13 +503,19 @@ impl SpotifyApi for HttpSpotify {
     }
 
     async fn search(&self, token: &str, query: &str, limit: u8) -> Result<SearchResults> {
-        let q = [
-            ("q", query.to_string()),
-            ("type", "track,playlist,album".to_string()),
-            ("limit", limit.clamp(1, 50).to_string()),
-        ];
-        let resp = self.send(Method::GET, "/search", token, &q, None).await?;
-        let wire: WireSearch = serde_json::from_str(&resp.text().await?)?;
+        let limit = limit.clamp(1, SEARCH_MAX_LIMIT);
+        let resp = match self.search_request(token, query, limit).await {
+            // Newer app quotas can cap `limit` below 50: retry once with a small one.
+            Err(BardicError::Api { status: 400, message })
+                if limit > SEARCH_FALLBACK_LIMIT && message.to_ascii_lowercase().contains("limit") =>
+            {
+                tracing::debug!(limit, "search rejected limit; retrying with fallback");
+                self.search_request(token, query, SEARCH_FALLBACK_LIMIT).await?
+            }
+            other => other?,
+        };
+        let text = resp.text().await.map_err(|e| BardicError::from(e.without_url()))?;
+        let wire: WireSearch = serde_json::from_str(&text)?;
         Ok(SearchResults {
             tracks: wire.tracks.unwrap_or_default().items.into_iter().flatten().filter_map(track_from_item).collect(),
             playlists: wire

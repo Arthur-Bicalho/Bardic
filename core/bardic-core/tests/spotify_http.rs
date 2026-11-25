@@ -1,5 +1,6 @@
 //! Integration tests for `HttpSpotify` against a wiremock server.
 use bardic_core::model::RepeatMode;
+use bardic_core::spotify::http::SEARCH_MAX_LIMIT;
 use bardic_core::spotify::{HttpSpotify, PlayRequest, SpotifyApi};
 use bardic_core::BardicError;
 use serde_json::json;
@@ -451,7 +452,7 @@ async fn search_maps_results_and_skips_null_playlists() {
         .and(path("/v1/search"))
         .and(query_param("q", "tavern & inn: \"brawl\""))
         .and(query_param("type", "track,playlist,album"))
-        .and(query_param("limit", "50"))
+        .and(query_param("limit", SEARCH_MAX_LIMIT.to_string()))
         .respond_with(ResponseTemplate::new(200).set_body_json(body))
         .expect(1)
         .mount(&server)
@@ -500,6 +501,80 @@ async fn search_clamps_limit_low_and_tolerates_missing_sections() {
     assert!(r.tracks.is_empty() && r.playlists.is_empty() && r.albums.is_empty());
 }
 
+#[tokio::test]
+async fn search_400_limit_error_retries_once_with_limit_10() {
+    let (server, api) = setup().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/search"))
+        .and(query_param("limit", "50"))
+        .respond_with(spotify_error(400, "Invalid limit", None))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/search"))
+        .and(query_param("limit", "10"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "tracks": {"items": [{"name": "T", "uri": "spotify:track:t1", "artists": []}]}
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let r = api.search(TOKEN, "tavern", 50).await.unwrap();
+    assert_eq!(r.tracks.len(), 1);
+}
+
+#[tokio::test]
+async fn search_400_limit_retry_happens_only_once() {
+    let (server, api) = setup().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/search"))
+        .respond_with(spotify_error(400, "Invalid limit", None))
+        .expect(2)
+        .mount(&server)
+        .await;
+    let e = api.search(TOKEN, "tavern", 50).await.unwrap_err();
+    assert!(matches!(e, BardicError::Api { status: 400, .. }), "{e:?}");
+}
+
+#[tokio::test]
+async fn search_400_unrelated_message_is_not_retried() {
+    let (server, api) = setup().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/search"))
+        .respond_with(spotify_error(400, "No search query", None))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let e = api.search(TOKEN, "", 50).await.unwrap_err();
+    assert!(matches!(e, BardicError::Api { status: 400, .. }), "{e:?}");
+}
+
+#[tokio::test]
+async fn search_400_limit_at_or_below_fallback_is_not_retried() {
+    let (server, api) = setup().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/search"))
+        .respond_with(spotify_error(400, "Invalid limit", None))
+        .expect(1)
+        .mount(&server)
+        .await;
+    assert!(api.search(TOKEN, "x", 10).await.is_err());
+}
+
+#[tokio::test]
+async fn network_error_does_not_leak_query() {
+    let api = HttpSpotify::with_base_url("http://127.0.0.1:1/v1");
+    let e = api.search(TOKEN, "secret-search-text", 5).await.unwrap_err();
+    assert!(matches!(e, BardicError::Network(_)), "{e:?}");
+    assert!(!e.to_string().contains("secret-search-text"), "{e}");
+}
+
+#[test]
+fn try_with_base_url_builds_and_trims_slash() {
+    assert!(HttpSpotify::try_with_base_url("http://127.0.0.1:1/v1/").is_ok());
+}
+
 // ---------------------------------------------------------------- error mapping
 
 async fn error_from(template: ResponseTemplate) -> BardicError {
@@ -519,22 +594,78 @@ async fn error_401_is_not_authenticated() {
     assert!(matches!(e, BardicError::NotAuthenticated), "{e:?}");
 }
 
+fn spotify_error(status: u16, message: &str, reason: Option<&str>) -> ResponseTemplate {
+    let mut err = json!({"status": status, "message": message});
+    if let Some(r) = reason {
+        err["reason"] = json!(r);
+    }
+    ResponseTemplate::new(status).set_body_json(json!({ "error": err }))
+}
+
 #[tokio::test]
-async fn error_403_is_forbidden_with_message() {
-    let body = json!({"error": {"status": 403, "message": "Player command failed: Premium required",
-                                "reason": "PREMIUM_REQUIRED"}});
-    let e = error_from(ResponseTemplate::new(403).set_body_json(body)).await;
-    match e {
+async fn error_403_premium_required_is_forbidden() {
+    let t = spotify_error(403, "Player command failed: Premium required", Some("PREMIUM_REQUIRED"));
+    match error_from(t).await {
         BardicError::Forbidden(m) => assert!(m.contains("Premium required"), "{m}"),
         other => panic!("{other:?}"),
     }
 }
 
 #[tokio::test]
+async fn error_403_restriction_violated_with_unknown_reason_is_restricted() {
+    let t = spotify_error(403, "Player command failed: Restriction violated", Some("UNKNOWN"));
+    match error_from(t).await {
+        BardicError::Restricted(m) => assert!(m.contains("Restriction violated"), "{m}"),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn error_403_restriction_violated_without_reason_is_restricted() {
+    let t = spotify_error(403, "player command failed: restriction VIOLATED", None);
+    let e = error_from(t).await;
+    assert!(matches!(e, BardicError::Restricted(_)), "{e:?}");
+}
+
+#[tokio::test]
+async fn error_403_already_paused_is_restricted() {
+    let t = spotify_error(403, "Player command failed: Already paused", Some("ALREADY_PAUSED"));
+    let e = error_from(t).await;
+    assert!(matches!(e, BardicError::Restricted(_)), "{e:?}");
+}
+
+#[tokio::test]
+async fn error_403_other_player_state_reasons_are_restricted() {
+    for reason in ["NOT_PAUSED", "NO_PREV_TRACK", "NO_NEXT_TRACK", "NO_SPECIFIC_TRACK", "CONTEXT_DISALLOW", "DISALLOWED"] {
+        let e = error_from(spotify_error(403, "Player command failed", Some(reason))).await;
+        assert!(matches!(e, BardicError::Restricted(_)), "{reason}: {e:?}");
+    }
+}
+
+#[tokio::test]
+async fn error_403_unrecognised_is_forbidden() {
+    let e = error_from(spotify_error(403, "Insufficient client scope", None)).await;
+    assert!(matches!(e, BardicError::Forbidden(_)), "{e:?}");
+    let e = error_from(ResponseTemplate::new(403)).await;
+    assert!(matches!(e, BardicError::Forbidden(_)), "{e:?}");
+}
+
+#[tokio::test]
 async fn error_404_no_active_device() {
-    let body = json!({"error": {"status": 404, "message": "Player command failed: No active device found",
-                                "reason": "NO_ACTIVE_DEVICE"}});
-    let e = error_from(ResponseTemplate::new(404).set_body_json(body)).await;
+    let t = spotify_error(404, "Player command failed: No active device found", Some("NO_ACTIVE_DEVICE"));
+    let e = error_from(t).await;
+    assert!(matches!(e, BardicError::NoActiveDevice), "{e:?}");
+}
+
+#[tokio::test]
+async fn error_404_no_active_device_by_reason_alone() {
+    let e = error_from(spotify_error(404, "Something else", Some("NO_ACTIVE_DEVICE"))).await;
+    assert!(matches!(e, BardicError::NoActiveDevice), "{e:?}");
+}
+
+#[tokio::test]
+async fn error_404_device_in_message_is_no_active_device() {
+    let e = error_from(spotify_error(404, "Device not found", None)).await;
     assert!(matches!(e, BardicError::NoActiveDevice), "{e:?}");
 }
 
@@ -545,17 +676,44 @@ async fn error_404_on_player_endpoint_without_body_is_no_active_device() {
 }
 
 #[tokio::test]
-async fn error_404_on_non_player_endpoint_is_api_error() {
+async fn error_404_on_player_endpoint_with_non_json_body_is_no_active_device() {
+    let e = error_from(ResponseTemplate::new(404).set_body_string("Not Found")).await;
+    assert!(matches!(e, BardicError::NoActiveDevice), "{e:?}");
+}
+
+#[tokio::test]
+async fn bare_404_on_play_is_no_active_device() {
+    let (server, api) = setup().await;
+    Mock::given(method("PUT")).and(path("/v1/me/player/play")).respond_with(ResponseTemplate::new(404)).mount(&server).await;
+    let e = api.resume(TOKEN, None).await.unwrap_err();
+    assert!(matches!(e, BardicError::NoActiveDevice), "{e:?}");
+}
+
+#[tokio::test]
+async fn non_existing_id_404_on_play_is_not_found() {
+    let (server, api) = setup().await;
+    Mock::given(method("PUT"))
+        .and(path("/v1/me/player/play"))
+        .respond_with(spotify_error(404, "Non existing id: 'spotify:playlist:gone'", None))
+        .mount(&server)
+        .await;
+    let req = PlayRequest::Context { context_uri: "spotify:playlist:gone".into(), position_ms: 0 };
+    match api.play(TOKEN, None, &req).await.unwrap_err() {
+        BardicError::NotFound(m) => assert!(m.contains("Non existing id"), "{m}"),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn error_404_on_non_player_endpoint_is_not_found() {
     let (server, api) = setup().await;
     Mock::given(method("GET"))
         .and(path("/v1/search"))
-        .respond_with(
-            ResponseTemplate::new(404).set_body_json(json!({"error": {"status": 404, "message": "Not found"}})),
-        )
+        .respond_with(spotify_error(404, "Not found", None))
         .mount(&server)
         .await;
     let e = api.search(TOKEN, "x", 5).await.unwrap_err();
-    assert!(matches!(e, BardicError::Api { status: 404, .. }), "{e:?}");
+    assert!(matches!(e, BardicError::NotFound(_)), "{e:?}");
 }
 
 #[tokio::test]
