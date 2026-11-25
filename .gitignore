@@ -5,3 +5,4 @@
 *.db-journal
 bardic.toml
 local.properties
+.claude/worktrees/
