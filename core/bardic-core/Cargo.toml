@@ -1,0 +1,31 @@
+[package]
+name = "bardic-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Bardic shared core: Spotify control, campaign library, cue resolver"
+
+[features]
+default = []
+# OS keychain token storage (Linux Secret Service). Android supplies its own TokenStore.
+keyring-store = ["dep:keyring"]
+
+[dependencies]
+tokio.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+async-trait.workspace = true
+rusqlite.workspace = true
+rusqlite_migration.workspace = true
+sha2.workspace = true
+base64.workspace = true
+rand.workspace = true
+url.workspace = true
+tracing.workspace = true
+keyring = { workspace = true, optional = true }
+
+[dev-dependencies]
+wiremock.workspace = true
+tokio = { workspace = true, features = ["test-util"] }

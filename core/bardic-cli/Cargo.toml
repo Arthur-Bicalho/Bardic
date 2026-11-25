@@ -1,0 +1,16 @@
+[package]
+name = "bardic-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Developer test harness for bardic-core"
+
+[[bin]]
+name = "bardic"
+path = "src/main.rs"
+
+[dependencies]
+bardic-core = { workspace = true, features = ["keyring-store"] }
+tokio.workspace = true
+serde_json.workspace = true
+tracing-subscriber.workspace = true
