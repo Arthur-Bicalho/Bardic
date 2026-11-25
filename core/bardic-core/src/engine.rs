@@ -5,12 +5,19 @@
 //! and runs volume fades as stepped `set_volume` calls.
 //!
 //! # Supersession (cancellation)
-//! Every *transport* action — `play_*`, `pause`, `resume`, `set_volume`,
-//! `fade_out_and_pause` — bumps a generation counter. Long sequences (fade → play → repeat →
-//! shuffle → fade) re-check the generation before every Spotify call and between fade steps;
-//! when a newer transport action has started, the older call stops issuing requests and
-//! returns `Ok(())`. `next`, `previous`, `seek`, `set_repeat`, `set_shuffle`, `refresh` and
-//! `devices` do **not** supersede anything (e.g. toggling shuffle does not cut a fade-in short).
+//! Two counters scope cancellation:
+//! - the **transport generation** is bumped by `play_*` and `fade_out_and_pause`. A sequence
+//!   (fade → transfer → play → repeat/shuffle → fade) re-checks it before every Spotify call;
+//!   once a newer sequence started, the older one stops issuing requests and returns `Ok(())`.
+//! - the **fade epoch** is bumped by `set_volume`, `pause` and `resume`. It only cancels an
+//!   in-flight fade: the sequence keeps going (play, repeat, …) but skips its remaining fade
+//!   steps. A user `set_volume` then owns the volume (the sequence won't touch it again and the
+//!   value becomes the new base volume); after `pause`/`resume` the target volume is set
+//!   directly instead of ramped.
+//!
+//! `next`, `previous`, `seek`, `set_repeat`, `set_shuffle`, `refresh` and `devices` cancel
+//! nothing. Mutating Spotify calls are serialized (one request in flight at a time), so a stale
+//! step of a superseded sequence can never land *after* a newer call.
 //!
 //! # Active cue / environment ownership
 //! When Bardic starts playback it remembers a signature of what it asked for: the context URI
@@ -25,12 +32,20 @@
 //! ownership is dropped for good: `active_cue_id`/`active_environment_id` become `None`.
 //!
 //! # Volume bookkeeping
-//! The engine tracks a *base volume*: the volume the GM wants when nothing is fading. It is
-//! updated by `set_volume`, by a completed cue fade-in, and by polled snapshots while no
-//! sequence is running and no fade was interrupted. Fades that get superseded midway therefore
-//! never leak their intermediate volume into the next cue's "pre-fade volume".
+//! The engine tracks a *base volume*: the (non-zero) volume the GM wants when nothing is
+//! fading. It is updated by a non-zero `set_volume`, by a completed cue fade-in, and by polled
+//! snapshots taken while no sequence ran and the engine owned no volume change. Before any
+//! programmatic volume change the engine marks the volume as *engine-owned* together with the
+//! value to settle on; if the sequence fails (or a pause interrupts the fade) that value is
+//! restored best-effort, so an error never leaves the device silent. `0` is never adopted as
+//! base volume.
+//!
+//! # Stale polls
+//! Each poll is stamped at request start. If any mutating Spotify call or transport/fade action
+//! overlapped the request, the snapshot is discarded (the engine's own bookkeeping is fresher).
 //!
 //! Never holds the std `Mutex` across an `.await`.
+use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::Duration;
@@ -39,6 +54,7 @@ use rand::seq::SliceRandom;
 use rand::Rng;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 
 use crate::auth::AccessTokenProvider;
 use crate::clock::Clock;
@@ -47,6 +63,13 @@ use crate::model::{
 };
 use crate::spotify::{PlayRequest, SpotifyApi};
 use crate::{BardicError, Result};
+
+/// Spotify accepts at most this many URIs in one `play` call.
+const MAX_PLAY_URIS: usize = 100;
+/// Longest `Retry-After` a fade waits before jumping to its target.
+const MAX_FADE_RATE_LIMIT_WAIT: Duration = Duration::from_secs(2);
+/// Wait before re-trying `play` on a device that was just transferred to.
+const TRANSFER_SETTLE: Duration = Duration::from_millis(500);
 
 /// UI callback (UniFFI callback interface later). Called from tokio worker tasks; never while
 /// the engine holds a lock, so implementations may call back into the engine's sync methods.
@@ -127,8 +150,13 @@ struct Inner {
     devices: Vec<Device>,
     owner: Option<Ownership>,
     base_volume: Option<u8>,
-    /// A fade was interrupted; polled volumes are not adopted as base until fixed.
-    volume_dirty: bool,
+    /// The engine changed the volume programmatically and hasn't settled it yet; polled
+    /// volumes are not adopted as base meanwhile.
+    vol_engine_owned: bool,
+    /// Volume to restore if an engine-owned change is abandoned (error / pause mid-fade).
+    settle_to: Option<u8>,
+    /// Bumped by every user `set_volume`; sequences leave the volume alone once it changed.
+    user_volume_seq: u64,
     /// Number of running play/fade sequences.
     busy: usize,
 }
@@ -149,6 +177,27 @@ impl Drop for BusyGuard<'_> {
     }
 }
 
+/// Marks a mutating Spotify request as in flight (for stale-poll detection).
+struct InFlight<'a> {
+    seq: &'a AtomicU64,
+    count: &'a AtomicU64,
+}
+
+impl<'a> InFlight<'a> {
+    fn new(seq: &'a AtomicU64, count: &'a AtomicU64) -> Self {
+        count.fetch_add(1, Ordering::SeqCst);
+        seq.fetch_add(1, Ordering::SeqCst);
+        Self { seq, count }
+    }
+}
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        self.seq.fetch_add(1, Ordering::SeqCst);
+        self.count.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 fn lock(m: &Mutex<Inner>) -> MutexGuard<'_, Inner> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -164,6 +213,35 @@ struct Snap {
     base: Option<u8>,
 }
 
+/// Counters captured when a sequence starts.
+#[derive(Debug, Clone, Copy)]
+struct Ctx {
+    gen: u64,
+    epoch: u64,
+    user_volume: u64,
+}
+
+/// How a fade ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FadeEnd {
+    /// Reached the target.
+    Done,
+    /// Fade epoch changed (`set_volume`/`pause`/`resume`): the sequence may continue.
+    Interrupted,
+    /// Transport generation changed: the whole sequence must stop.
+    Superseded,
+    /// Rate limited and the final jump to the target failed too.
+    Incomplete,
+}
+
+/// Counters a poll is stamped with at request start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PollStamp {
+    mutations: u64,
+    gen: u64,
+    epoch: u64,
+}
+
 struct Plan {
     req: PlayRequest,
     context_uri: Option<String>,
@@ -171,7 +249,8 @@ struct Plan {
 }
 
 /// Build the play request. Tracks win over contexts (mixed lists play tracks only); a list of
-/// only contexts plays the first one (a random one when `shuffle`).
+/// only contexts plays the first one (a random one when `shuffle`). Track lists are shuffled
+/// locally and capped at Spotify's 100-URI limit.
 fn plan(items: &[&TrackRef], shuffle: bool) -> Result<Plan> {
     let (mut tracks, contexts): (Vec<&TrackRef>, Vec<&TrackRef>) =
         items.iter().copied().partition(|t| t.is_track());
@@ -184,6 +263,14 @@ fn plan(items: &[&TrackRef], shuffle: bool) -> Result<Plan> {
         }
         if shuffle {
             tracks.shuffle(&mut rand::thread_rng());
+        }
+        if tracks.len() > MAX_PLAY_URIS {
+            tracing::warn!(
+                count = tracks.len(),
+                max = MAX_PLAY_URIS,
+                "too many tracks for one Spotify play call; truncating"
+            );
+            tracks.truncate(MAX_PLAY_URIS);
         }
         let uris: Vec<String> = tracks.iter().map(|t| t.spotify_uri.clone()).collect();
         let position_ms = tracks[0].start_offset_ms;
@@ -240,13 +327,33 @@ fn meaningful_change(prev: &PlaybackState, new: &PlaybackState, jump_ms: u32) ->
     (new.progress_ms as u64).abs_diff(expected) > jump_ms as u64
 }
 
+/// `Restricted` means "already in that state" for pause/resume.
+fn ok_if_restricted(r: Result<()>) -> Result<()> {
+    match r {
+        Err(BardicError::Restricted(msg)) => {
+            tracing::debug!(%msg, "player command restricted; treating as no-op");
+            Ok(())
+        }
+        r => r,
+    }
+}
+
 pub struct Engine {
     api: Arc<dyn SpotifyApi>,
     tokens: Arc<dyn AccessTokenProvider>,
     clock: Arc<dyn Clock>,
     observer: Arc<dyn EngineObserver>,
     config: EngineConfig,
+    /// Transport generation: cancels play/fade-out sequences.
     generation: AtomicU64,
+    /// Fade epoch: cancels only in-flight fades.
+    fade_epoch: AtomicU64,
+    /// Bumped at start and end of every mutating Spotify request.
+    mutations: AtomicU64,
+    /// Mutating Spotify requests currently in flight.
+    in_flight: AtomicU64,
+    /// Serializes mutating Spotify requests (held for one request only).
+    call_lock: tokio::sync::Mutex<()>,
     inner: Mutex<Inner>,
 }
 
@@ -265,6 +372,10 @@ impl Engine {
             observer,
             config,
             generation: AtomicU64::new(0),
+            fade_epoch: AtomicU64::new(0),
+            mutations: AtomicU64::new(0),
+            in_flight: AtomicU64::new(0),
+            call_lock: tokio::sync::Mutex::new(()),
             inner: Mutex::new(Inner::default()),
         })
     }
@@ -282,13 +393,45 @@ impl Engine {
         r
     }
 
-    /// Start a new transport action; supersedes older ones.
-    fn bump(&self) -> u64 {
-        self.generation.fetch_add(1, Ordering::SeqCst) + 1
+    /// Start a new transport sequence; supersedes older ones.
+    fn begin_sequence(&self) -> Ctx {
+        let gen = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        Ctx {
+            gen,
+            epoch: self.fade_epoch.load(Ordering::SeqCst),
+            user_volume: self.lock().user_volume_seq,
+        }
+    }
+
+    /// Cancel in-flight fades (not the sequences running them).
+    fn bump_epoch(&self) {
+        self.fade_epoch.fetch_add(1, Ordering::SeqCst);
     }
 
     fn is_current(&self, gen: u64) -> bool {
         self.generation.load(Ordering::SeqCst) == gen
+    }
+
+    fn cancelled(&self, ctx: &Ctx) -> Option<FadeEnd> {
+        if !self.is_current(ctx.gen) {
+            Some(FadeEnd::Superseded)
+        } else if self.fade_epoch.load(Ordering::SeqCst) != ctx.epoch {
+            Some(FadeEnd::Interrupted)
+        } else {
+            None
+        }
+    }
+
+    fn user_changed_volume(&self, ctx: &Ctx) -> bool {
+        self.lock().user_volume_seq != ctx.user_volume
+    }
+
+    fn poll_stamp(&self) -> PollStamp {
+        PollStamp {
+            mutations: self.mutations.load(Ordering::SeqCst),
+            gen: self.generation.load(Ordering::SeqCst),
+            epoch: self.fade_epoch.load(Ordering::SeqCst),
+        }
     }
 
     /// Device for non-play commands: the selected one, unless it isn't active yet.
@@ -309,6 +452,64 @@ impl Engine {
     fn set_cached_volume(&self, v: u8) {
         if let Some(d) = self.lock().state.device.as_mut() {
             d.volume_percent = Some(v);
+        }
+    }
+
+    fn cached_volume(&self) -> Option<u8> {
+        self.lock()
+            .state
+            .device
+            .as_ref()
+            .and_then(|d| d.volume_percent)
+    }
+
+    /// The engine is about to change the volume; `settle` is what to restore if abandoned.
+    fn mark_engine_volume(&self, settle: Option<u8>) {
+        let mut i = self.lock();
+        i.vol_engine_owned = true;
+        if settle.is_some() {
+            i.settle_to = settle;
+        }
+    }
+
+    /// An engine-owned volume change reached `v`, the new base volume.
+    fn settle_volume(&self, v: u8) {
+        let mut i = self.lock();
+        if v > 0 {
+            i.base_volume = Some(v);
+        }
+        i.vol_engine_owned = false;
+        i.settle_to = None;
+    }
+
+    /// If an engine-owned volume change was abandoned, set the volume it should settle on.
+    /// Claims the restore under the lock, so concurrent callers restore at most once.
+    async fn restore_volume(&self, dev: Option<&str>) -> Result<()> {
+        let v = {
+            let mut i = self.lock();
+            if !i.vol_engine_owned {
+                return Ok(());
+            }
+            i.vol_engine_owned = false;
+            i.settle_to.take()
+        };
+        let Some(v) = v else { return Ok(()) };
+        match self.sp_set_volume(dev, v).await {
+            Ok(()) => {
+                self.set_cached_volume(v);
+                self.settle_volume(v);
+                Ok(())
+            }
+            Err(e) => {
+                self.mark_engine_volume(Some(v));
+                Err(e)
+            }
+        }
+    }
+
+    async fn restore_volume_quietly(&self, dev: Option<&str>) {
+        if let Err(e) = self.restore_volume(dev).await {
+            tracing::warn!(error = %e, "could not restore volume");
         }
     }
 
@@ -346,11 +547,140 @@ impl Engine {
         }
     }
 
+    // ------------------------------------------------------------ Spotify calls
+
+    /// Central Spotify call: fetches a token, retries once with a fresh token on 401, and
+    /// (for `mutating` calls) serializes the request and marks it in flight for stale-poll
+    /// detection.
+    async fn call<T, F, Fut>(&self, mutating: bool, f: F) -> Result<T>
+    where
+        F: Fn(String) -> Fut,
+        Fut: Future<Output = Result<T>>,
+    {
+        let _serial = if mutating {
+            Some(self.call_lock.lock().await)
+        } else {
+            None
+        };
+        let _in_flight = mutating.then(|| InFlight::new(&self.mutations, &self.in_flight));
+        let token = self.tokens.access_token().await?;
+        match f(token.clone()).await {
+            Err(BardicError::NotAuthenticated) => {
+                tracing::info!("access token rejected; refreshing and retrying once");
+                self.tokens.invalidate(&token);
+                let fresh = self.tokens.access_token().await?;
+                f(fresh).await
+            }
+            r => r,
+        }
+    }
+
+    async fn sp_playback_state(&self) -> Result<Option<PlaybackState>> {
+        let api = &self.api;
+        self.call(false, move |t| async move { api.playback_state(&t).await })
+            .await
+    }
+
+    async fn sp_devices(&self) -> Result<Vec<Device>> {
+        let api = &self.api;
+        self.call(false, move |t| async move { api.devices(&t).await })
+            .await
+    }
+
+    async fn sp_play(&self, dev: Option<&str>, req: &PlayRequest) -> Result<()> {
+        let api = &self.api;
+        self.call(true, move |t| async move { api.play(&t, dev, req).await })
+            .await
+    }
+
+    async fn sp_pause(&self, dev: Option<&str>) -> Result<()> {
+        let api = &self.api;
+        self.call(true, move |t| async move { api.pause(&t, dev).await })
+            .await
+    }
+
+    async fn sp_resume(&self, dev: Option<&str>) -> Result<()> {
+        let api = &self.api;
+        self.call(true, move |t| async move { api.resume(&t, dev).await })
+            .await
+    }
+
+    async fn sp_next(&self, dev: Option<&str>) -> Result<()> {
+        let api = &self.api;
+        self.call(true, move |t| async move { api.next(&t, dev).await })
+            .await
+    }
+
+    async fn sp_previous(&self, dev: Option<&str>) -> Result<()> {
+        let api = &self.api;
+        self.call(true, move |t| async move { api.previous(&t, dev).await })
+            .await
+    }
+
+    async fn sp_seek(&self, dev: Option<&str>, position_ms: u32) -> Result<()> {
+        let api = &self.api;
+        self.call(true, move |t| async move {
+            api.seek(&t, dev, position_ms).await
+        })
+        .await
+    }
+
+    async fn sp_set_repeat(&self, dev: Option<&str>, mode: RepeatMode) -> Result<()> {
+        let api = &self.api;
+        self.call(
+            true,
+            move |t| async move { api.set_repeat(&t, dev, mode).await },
+        )
+        .await
+    }
+
+    async fn sp_set_shuffle(&self, dev: Option<&str>, on: bool) -> Result<()> {
+        let api = &self.api;
+        self.call(
+            true,
+            move |t| async move { api.set_shuffle(&t, dev, on).await },
+        )
+        .await
+    }
+
+    async fn sp_set_volume(&self, dev: Option<&str>, percent: u8) -> Result<()> {
+        let api = &self.api;
+        self.call(true, move |t| async move {
+            api.set_volume(&t, dev, percent).await
+        })
+        .await
+    }
+
+    async fn sp_transfer(&self, dev: &str) -> Result<()> {
+        let api = &self.api;
+        self.call(
+            true,
+            move |t| async move { api.transfer(&t, dev, false).await },
+        )
+        .await
+    }
+
     // ------------------------------------------------------------ state
 
     /// Cached snapshot (no network).
     pub fn state(&self) -> PlaybackState {
         self.lock().state.clone()
+    }
+
+    /// Forget all cached playback state (e.g. on logout) and cancel running sequences/fades.
+    pub fn reset(&self) {
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        self.bump_epoch();
+        let s = {
+            let mut i = self.lock();
+            let busy = i.busy;
+            let user_volume_seq = i.user_volume_seq;
+            *i = Inner::default();
+            i.busy = busy;
+            i.user_volume_seq = user_volume_seq;
+            i.state.clone()
+        };
+        self.observer.on_playback_changed(&s);
     }
 
     /// Poll Spotify once. Notifies the observer if the state meaningfully changed.
@@ -360,11 +690,17 @@ impl Engine {
     }
 
     async fn refresh_inner(&self) -> Result<PlaybackState> {
-        let token = self.tokens.access_token().await?;
-        let fetched = self.api.playback_state(&token).await?;
+        let stamp = self.poll_stamp();
+        let in_flight_at_start = self.in_flight.load(Ordering::SeqCst) > 0;
+        let busy_at_start = self.lock().busy > 0;
+        let fetched = self.sp_playback_state().await?;
         let now = self.clock.now_ms();
         let (snapshot, changed) = {
             let mut i = self.lock();
+            if in_flight_at_start || self.poll_stamp() != stamp {
+                tracing::debug!("discarding playback snapshot that raced a player command");
+                return Ok(i.state.clone());
+            }
             let mut s = fetched.unwrap_or_default();
             s.fetched_at_ms = now;
             s.active_cue_id = None;
@@ -383,8 +719,13 @@ impl Engine {
                     i.pending_transfer = false;
                 }
             }
-            if i.busy == 0 && !i.volume_dirty {
-                if let Some(v) = s.device.as_ref().and_then(|d| d.volume_percent) {
+            if !busy_at_start && i.busy == 0 && !i.vol_engine_owned {
+                if let Some(v) = s
+                    .device
+                    .as_ref()
+                    .and_then(|d| d.volume_percent)
+                    .filter(|v| *v > 0)
+                {
                     i.base_volume = Some(v);
                 }
             }
@@ -402,11 +743,7 @@ impl Engine {
     // ------------------------------------------------------------ devices
 
     pub async fn devices(&self) -> Result<Vec<Device>> {
-        let r = async {
-            let token = self.tokens.access_token().await?;
-            self.api.devices(&token).await
-        }
-        .await;
+        let r = self.sp_devices().await;
         let r = self.report(r)?;
         self.lock().devices = r.clone();
         Ok(r)
@@ -474,123 +811,225 @@ impl Engine {
         cue_id: Option<Id>,
         environment_id: Option<Id>,
     ) -> Result<()> {
-        let gen = self.bump();
+        let ctx = self.begin_sequence();
         let _busy = BusyGuard::new(&self.inner);
         self.ensure_fresh().await;
-        if !self.is_current(gen) {
+        if !self.is_current(ctx.gen) {
             return Ok(());
         }
-        let token = self.tokens.access_token().await?;
         let snap = self.snap();
-        let device = snap.selected.clone();
-        let dev = device.as_deref();
+        let r = self
+            .play_sequence(&ctx, &snap, &plan, opts, cue_id, environment_id)
+            .await;
+        if r.is_err() && self.is_current(ctx.gen) {
+            // Never leave the device faded down (old track playing silently).
+            self.restore_volume_quietly(snap.selected.as_deref()).await;
+        }
+        r
+    }
+
+    async fn play_sequence(
+        &self,
+        ctx: &Ctx,
+        snap: &Snap,
+        plan: &Plan,
+        opts: &CueOptions,
+        cue_id: Option<Id>,
+        environment_id: Option<Id>,
+    ) -> Result<()> {
+        let dev = snap.selected.as_deref();
         let target = opts
             .volume
             .map(|v| v.min(100))
-            .or(snap.base.or(snap.cur_vol));
+            .or(snap.base)
+            .or(snap.cur_vol.filter(|v| *v > 0));
+        // What to restore if we lower the volume and then fail.
+        let pre_fade = snap.base.or(snap.cur_vol).filter(|v| *v > 0);
         let can_fade = snap.supports_volume && !snap.pending_transfer;
         let mut level = snap.cur_vol;
 
         // 1. fade down (or pre-silence before a fade-in when nothing is playing)
         if let Some(v) = level.filter(|v| can_fade && *v > 0) {
             if snap.playing && opts.fade_out_ms > 0 {
-                if !self.fade(gen, &token, dev, v, 0, opts.fade_out_ms).await? {
-                    return Ok(());
+                self.mark_engine_volume(pre_fade);
+                match self.fade(ctx, dev, v, 0, opts.fade_out_ms).await? {
+                    FadeEnd::Superseded => return Ok(()),
+                    FadeEnd::Done => level = Some(0),
+                    FadeEnd::Interrupted | FadeEnd::Incomplete => level = self.cached_volume(),
                 }
-                level = Some(0);
-            } else if !snap.playing && opts.fade_in_ms > 0 && target.is_some_and(|t| t > 0) {
-                self.api.set_volume(&token, dev, 0).await?;
+            } else if !snap.playing
+                && opts.fade_in_ms > 0
+                && target.is_some_and(|t| t > 0)
+                && self.cancelled(ctx).is_none()
+            {
+                self.mark_engine_volume(pre_fade);
+                self.sp_set_volume(dev, 0).await?;
                 self.set_cached_volume(0);
                 level = Some(0);
             }
         }
-        if !self.is_current(gen) {
+        if !self.is_current(ctx.gen) {
             return Ok(());
         }
 
-        // 2. device transfer + play
+        // 2. device transfer
+        let mut transferred = false;
         if snap.pending_transfer {
             if let Some(d) = dev {
-                self.api.transfer(&token, d, false).await?;
+                self.sp_transfer(d).await?;
                 self.lock().pending_transfer = false;
-            }
-        }
-        self.play_with_retry(&token, dev, &plan.req).await?;
-        {
-            let mut i = self.lock();
-            if self.is_current(gen) {
-                i.owner = Some(Ownership {
-                    cue_id,
-                    environment_id,
-                    context_uri: plan.context_uri.clone(),
-                    track_uris: plan.track_uris.clone(),
-                    started_at_ms: self.clock.now_ms(),
-                });
-                i.state.is_playing = true;
-                i.state.active_cue_id = cue_id;
-                i.state.active_environment_id = environment_id;
+                transferred = true;
             }
         }
 
-        // 3. repeat + shuffle
-        if !self.is_current(gen) {
+        // 3. repeat/shuffle before play for contexts (so a shuffled playlist doesn't start
+        //    on track 1), play, then repeat/shuffle for track lists (applies to the new queue).
+        let is_context = plan.context_uri.is_some();
+        let mut modes_todo = (true, true);
+        if is_context {
+            modes_todo = self.apply_modes(ctx, dev, opts, modes_todo, false).await;
+            if !self.is_current(ctx.gen) {
+                return Ok(());
+            }
+        }
+        self.play_with_retry(ctx, dev, &plan.req, transferred)
+            .await?;
+        {
+            let mut i = self.lock();
+            if !self.is_current(ctx.gen) {
+                return Ok(());
+            }
+            i.owner = Some(Ownership {
+                cue_id,
+                environment_id,
+                context_uri: plan.context_uri.clone(),
+                track_uris: plan.track_uris.clone(),
+                started_at_ms: self.clock.now_ms(),
+            });
+            i.state.is_playing = true;
+            i.state.active_cue_id = cue_id;
+            i.state.active_environment_id = environment_id;
+            // From now on an abandoned volume change should settle on the new cue's level.
+            if i.vol_engine_owned && target.is_some() {
+                i.settle_to = target;
+            }
+        }
+        self.apply_modes(ctx, dev, opts, modes_todo, true).await;
+        if !self.is_current(ctx.gen) {
             return Ok(());
         }
-        self.api.set_repeat(&token, dev, opts.repeat).await?;
-        self.lock().state.repeat = opts.repeat;
-        if !self.is_current(gen) {
-            return Ok(());
-        }
-        self.api.set_shuffle(&token, dev, opts.shuffle).await?;
-        self.lock().state.shuffle = opts.shuffle;
 
         // 4. fade up / set target volume
         if let Some(t) = target.filter(|_| snap.supports_volume) {
-            if !self.is_current(gen) {
-                return Ok(());
-            }
-            let completed = match level {
-                Some(l) if can_fade && opts.fade_in_ms > 0 => {
-                    self.fade(gen, &token, dev, l, t, opts.fade_in_ms).await?
+            if self.user_changed_volume(ctx) {
+                // The GM moved the slider meanwhile: their volume wins.
+                tracing::debug!("user changed volume during cue switch; skipping fade-in");
+            } else {
+                let interrupted = self.cancelled(ctx).is_some();
+                let owned = self.lock().vol_engine_owned;
+                let end = match level {
+                    Some(l) if can_fade && opts.fade_in_ms > 0 && !interrupted && l != t => {
+                        self.mark_engine_volume(Some(t));
+                        self.fade(ctx, dev, l, t, opts.fade_in_ms).await?
+                    }
+                    Some(l) if l == t && !owned => FadeEnd::Done,
+                    _ => {
+                        self.mark_engine_volume(Some(t));
+                        self.sp_set_volume(dev, t).await?;
+                        self.set_cached_volume(t);
+                        FadeEnd::Done
+                    }
+                };
+                match end {
+                    FadeEnd::Superseded => return Ok(()),
+                    FadeEnd::Done => self.settle_volume(t),
+                    FadeEnd::Interrupted => {
+                        if !self.user_changed_volume(ctx) {
+                            // pause/resume cut the fade short: land on the target directly.
+                            self.restore_volume_quietly(dev).await;
+                        }
+                    }
+                    FadeEnd::Incomplete => {
+                        tracing::warn!(target = t, "fade-in did not reach its target volume");
+                    }
                 }
-                Some(l) if l == t => true,
-                _ => {
-                    self.api.set_volume(&token, dev, t).await?;
-                    self.set_cached_volume(t);
-                    true
-                }
-            };
-            if !completed {
-                return Ok(());
             }
-            let mut i = self.lock();
-            i.base_volume = Some(t);
-            i.volume_dirty = false;
         }
-        if self.is_current(gen) {
+        if self.is_current(ctx.gen) {
             self.notify_current();
         }
         Ok(())
     }
 
+    /// Apply repeat/shuffle for the items still in `todo` (repeat, shuffle). Failures are not
+    /// fatal: returns what still needs doing; on the `last_try` they are logged and reported.
+    async fn apply_modes(
+        &self,
+        ctx: &Ctx,
+        dev: Option<&str>,
+        opts: &CueOptions,
+        todo: (bool, bool),
+        last_try: bool,
+    ) -> (bool, bool) {
+        let (mut repeat, mut shuffle) = todo;
+        let failed = |what: &str, e: BardicError| {
+            if last_try {
+                tracing::warn!(error = %e, "could not set {what}; continuing");
+                self.observer.on_error(&e);
+            } else {
+                tracing::debug!(error = %e, "could not set {what} before play; retrying after");
+            }
+        };
+        if repeat && self.is_current(ctx.gen) {
+            match self.sp_set_repeat(dev, opts.repeat).await {
+                Ok(()) => {
+                    self.lock().state.repeat = opts.repeat;
+                    repeat = false;
+                }
+                Err(e) => failed("repeat", e),
+            }
+        }
+        if shuffle && self.is_current(ctx.gen) {
+            match self.sp_set_shuffle(dev, opts.shuffle).await {
+                Ok(()) => {
+                    self.lock().state.shuffle = opts.shuffle;
+                    shuffle = false;
+                }
+                Err(e) => failed("shuffle", e),
+            }
+        }
+        (repeat, shuffle)
+    }
+
+    /// `play`; on `NoActiveDevice` with a known device: transfer (unless just done) and retry;
+    /// if a freshly transferred device still isn't ready, wait a moment and retry once more.
     async fn play_with_retry(
         &self,
-        token: &str,
+        ctx: &Ctx,
         dev: Option<&str>,
         req: &PlayRequest,
+        transferred: bool,
     ) -> Result<()> {
-        match self.api.play(token, dev, req).await {
-            Err(BardicError::NoActiveDevice) => match dev {
-                Some(d) => {
-                    tracing::info!(device = d, "no active device; transferring and retrying");
-                    self.api.transfer(token, d, false).await?;
-                    self.lock().pending_transfer = false;
-                    self.api.play(token, Some(d), req).await
-                }
-                None => Err(BardicError::NoActiveDevice),
-            },
-            r => r,
+        let first = self.sp_play(dev, req).await;
+        let Some(d) = dev else { return first };
+        if !matches!(first, Err(BardicError::NoActiveDevice)) {
+            return first;
         }
+        if !transferred {
+            tracing::info!(device = d, "no active device; transferring and retrying");
+            self.sp_transfer(d).await?;
+            self.lock().pending_transfer = false;
+            let second = self.sp_play(Some(d), req).await;
+            if !matches!(second, Err(BardicError::NoActiveDevice)) {
+                return second;
+            }
+        }
+        tracing::info!(device = d, "device not ready after transfer; retrying play");
+        tokio::time::sleep(TRANSFER_SETTLE).await;
+        if !self.is_current(ctx.gen) {
+            return Ok(());
+        }
+        self.sp_play(Some(d), req).await
     }
 
     // ------------------------------------------------------------ fades
@@ -608,56 +1047,66 @@ impl Engine {
         steps.max(1)
     }
 
-    /// Stepped volume ramp `from → to` over ~`duration_ms`. Returns `Ok(false)` if a newer
-    /// transport action superseded it (stops stepping immediately).
+    /// Stepped volume ramp `from → to` over ~`duration_ms`. Steps are scheduled against
+    /// deadlines relative to the fade start (request latency doesn't stretch the fade), and
+    /// never exceed `|to − from|` (no repeated volumes). Stops as soon as the transport
+    /// generation (`Superseded`) or the fade epoch (`Interrupted`) changes.
     async fn fade(
         &self,
-        gen: u64,
-        token: &str,
+        ctx: &Ctx,
         dev: Option<&str>,
         from: u8,
         to: u8,
         duration_ms: u32,
-    ) -> Result<bool> {
-        if from == to {
-            return Ok(self.is_current(gen));
+    ) -> Result<FadeEnd> {
+        if let Some(end) = self.cancelled(ctx) {
+            return Ok(end);
         }
-        self.lock().volume_dirty = true;
-        let steps = self.step_count(duration_ms);
-        let interval = if steps > 1 {
-            duration_ms as u64 / (steps as u64 - 1)
-        } else {
-            0
-        };
+        if from == to {
+            return Ok(FadeEnd::Done);
+        }
+        let steps = self
+            .step_count(duration_ms)
+            .min(from.abs_diff(to) as u32)
+            .max(1);
+        let start = Instant::now();
         let (from_i, to_i) = (from as i64, to as i64);
         for i in 1..=steps {
-            if !self.is_current(gen) {
-                return Ok(false);
+            if let Some(end) = self.cancelled(ctx) {
+                return Ok(end);
             }
             let v = (from_i + (to_i - from_i) * i as i64 / steps as i64) as u8;
-            match self.api.set_volume(token, dev, v).await {
+            match self.sp_set_volume(dev, v).await {
                 Ok(()) => self.set_cached_volume(v),
                 Err(BardicError::RateLimited { retry_after_secs }) => {
+                    let wait = Duration::from_secs(retry_after_secs).min(MAX_FADE_RATE_LIMIT_WAIT);
                     tracing::warn!(
                         retry_after_secs,
                         "rate limited during fade; jumping to target"
                     );
-                    if !self.is_current(gen) {
-                        return Ok(false);
+                    tokio::time::sleep(wait).await;
+                    if let Some(end) = self.cancelled(ctx) {
+                        return Ok(end);
                     }
-                    match self.api.set_volume(token, dev, to).await {
-                        Ok(()) => self.set_cached_volume(to),
-                        Err(e) => tracing::warn!(error = %e, "could not set fade target volume"),
-                    }
-                    return Ok(self.is_current(gen));
+                    return match self.sp_set_volume(dev, to).await {
+                        Ok(()) => {
+                            self.set_cached_volume(to);
+                            Ok(FadeEnd::Done)
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "could not set fade target volume");
+                            Ok(FadeEnd::Incomplete)
+                        }
+                    };
                 }
                 Err(e) => return Err(e),
             }
             if i < steps {
-                tokio::time::sleep(Duration::from_millis(interval)).await;
+                let due_ms = duration_ms as u64 * i as u64 / (steps as u64 - 1);
+                tokio::time::sleep_until(start + Duration::from_millis(due_ms)).await;
             }
         }
-        Ok(self.is_current(gen))
+        Ok(self.cancelled(ctx).unwrap_or(FadeEnd::Done))
     }
 
     /// GM "panic / silence": fade to 0, pause, then restore the pre-fade volume *without*
@@ -668,42 +1117,45 @@ impl Engine {
     }
 
     async fn fade_out_and_pause_inner(&self, duration_ms: u32) -> Result<()> {
-        let gen = self.bump();
+        let ctx = self.begin_sequence();
         let _busy = BusyGuard::new(&self.inner);
         self.ensure_fresh().await;
-        let token = self.tokens.access_token().await?;
-        let snap = self.snap();
+        if !self.is_current(ctx.gen) {
+            return Ok(());
+        }
         let dev = self.cmd_device();
         let dev = dev.as_deref();
-        let mut restore = None;
+        let r = self.fade_out_and_pause_seq(&ctx, dev, duration_ms).await;
+        if r.is_err() && self.is_current(ctx.gen) {
+            self.restore_volume_quietly(dev).await;
+        }
+        r
+    }
+
+    async fn fade_out_and_pause_seq(
+        &self,
+        ctx: &Ctx,
+        dev: Option<&str>,
+        duration_ms: u32,
+    ) -> Result<()> {
+        let snap = self.snap();
         if let Some(v) = snap
             .cur_vol
             .filter(|v| *v > 0 && snap.playing && snap.supports_volume && !snap.pending_transfer)
         {
-            let restore_to = snap.base.unwrap_or(v);
-            if !self.fade(gen, &token, dev, v, 0, duration_ms).await? {
+            self.mark_engine_volume(snap.base.or(Some(v)).filter(|v| *v > 0));
+            if self.fade(ctx, dev, v, 0, duration_ms).await? == FadeEnd::Superseded {
                 return Ok(());
             }
-            restore = Some(restore_to);
         }
-        if !self.is_current(gen) {
+        if !self.is_current(ctx.gen) {
             return Ok(());
         }
-        match self.api.pause(&token, dev).await {
-            Ok(()) => {}
-            // Spotify rejects pausing an already-paused player; harmless for a panic button.
-            Err(BardicError::Forbidden(_)) if !snap.playing => {}
-            Err(e) => return Err(e),
-        }
+        // Restricted = already paused; harmless for a panic button.
+        ok_if_restricted(self.sp_pause(dev).await)?;
         self.lock().state.is_playing = false;
-        if let Some(r) = restore {
-            if self.is_current(gen) {
-                self.api.set_volume(&token, dev, r).await?;
-                self.set_cached_volume(r);
-                let mut i = self.lock();
-                i.base_volume = Some(r);
-                i.volume_dirty = false;
-            }
+        if self.is_current(ctx.gen) && !self.user_changed_volume(ctx) {
+            self.restore_volume(dev).await?;
         }
         self.notify_current();
         Ok(())
@@ -711,57 +1163,47 @@ impl Engine {
 
     // ------------------------------------------------------------ transport
 
+    /// Pause. Interrupts a running fade (the volume goes back to where it should settle, the
+    /// player stays paused); `Restricted` (already paused) counts as success.
     pub async fn pause(&self) -> Result<()> {
-        self.bump();
+        self.bump_epoch();
         let r = async {
-            let token = self.tokens.access_token().await?;
-            self.api.pause(&token, self.cmd_device().as_deref()).await?;
+            let dev = self.cmd_device();
+            ok_if_restricted(self.sp_pause(dev.as_deref()).await)?;
             self.lock().state.is_playing = false;
-            Ok(())
+            self.restore_volume(dev.as_deref()).await
         }
         .await;
         self.finish(r)
     }
 
+    /// Resume. Interrupts a running fade like [`Engine::pause`]; `Restricted` (already
+    /// playing) counts as success.
     pub async fn resume(&self) -> Result<()> {
-        self.bump();
+        self.bump_epoch();
         let r = async {
-            let token = self.tokens.access_token().await?;
-            self.api
-                .resume(&token, self.cmd_device().as_deref())
-                .await?;
+            let dev = self.cmd_device();
+            ok_if_restricted(self.sp_resume(dev.as_deref()).await)?;
             self.lock().state.is_playing = true;
-            Ok(())
+            self.restore_volume(dev.as_deref()).await
         }
         .await;
         self.finish(r)
     }
 
     pub async fn next(&self) -> Result<()> {
-        let r = async {
-            let token = self.tokens.access_token().await?;
-            self.api.next(&token, self.cmd_device().as_deref()).await
-        }
-        .await;
+        let r = self.sp_next(self.cmd_device().as_deref()).await;
         self.report(r)
     }
 
     pub async fn previous(&self) -> Result<()> {
-        let r = async {
-            let token = self.tokens.access_token().await?;
-            self.api
-                .previous(&token, self.cmd_device().as_deref())
-                .await
-        }
-        .await;
+        let r = self.sp_previous(self.cmd_device().as_deref()).await;
         self.report(r)
     }
 
     pub async fn seek(&self, position_ms: u32) -> Result<()> {
         let r = async {
-            let token = self.tokens.access_token().await?;
-            self.api
-                .seek(&token, self.cmd_device().as_deref(), position_ms)
+            self.sp_seek(self.cmd_device().as_deref(), position_ms)
                 .await?;
             let now = self.clock.now_ms();
             let mut i = self.lock();
@@ -775,9 +1217,7 @@ impl Engine {
 
     pub async fn set_repeat(&self, mode: RepeatMode) -> Result<()> {
         let r = async {
-            let token = self.tokens.access_token().await?;
-            self.api
-                .set_repeat(&token, self.cmd_device().as_deref(), mode)
+            self.sp_set_repeat(self.cmd_device().as_deref(), mode)
                 .await?;
             self.lock().state.repeat = mode;
             Ok(())
@@ -788,9 +1228,7 @@ impl Engine {
 
     pub async fn set_shuffle(&self, on: bool) -> Result<()> {
         let r = async {
-            let token = self.tokens.access_token().await?;
-            self.api
-                .set_shuffle(&token, self.cmd_device().as_deref(), on)
+            self.sp_set_shuffle(self.cmd_device().as_deref(), on)
                 .await?;
             self.lock().state.shuffle = on;
             Ok(())
@@ -799,19 +1237,17 @@ impl Engine {
         self.finish(r)
     }
 
-    /// User volume change: cancels running fades and becomes the new base volume.
+    /// User volume change: interrupts a running fade (the cue switch itself continues) and,
+    /// unless 0, becomes the new base volume.
     pub async fn set_volume(&self, percent: u8) -> Result<()> {
-        self.bump();
+        self.bump_epoch();
+        self.lock().user_volume_seq += 1;
         let percent = percent.min(100);
         let r = async {
-            let token = self.tokens.access_token().await?;
-            self.api
-                .set_volume(&token, self.cmd_device().as_deref(), percent)
+            self.sp_set_volume(self.cmd_device().as_deref(), percent)
                 .await?;
             self.set_cached_volume(percent);
-            let mut i = self.lock();
-            i.base_volume = Some(percent);
-            i.volume_dirty = false;
+            self.settle_volume(percent);
             Ok(())
         }
         .await;
@@ -834,7 +1270,8 @@ impl Engine {
     ///
     /// - interval: `active_poll_ms` in `PollMode::Active` while playing, else `idle_poll_ms`;
     /// - `RateLimited`: sleep `retry_after` (no observer error);
-    /// - `NotAuthenticated`: reported, then idle-rate polling until a refresh succeeds;
+    /// - `NotAuthenticated` (after the one automatic token refresh + retry): reported, then
+    ///   idle-rate polling until a refresh succeeds;
     /// - other errors are reported once per distinct message (no spam every second).
     pub fn spawn_poll_loop(self: &Arc<Self>) -> PollHandle {
         let (tx, rx) = watch::channel(PollMode::Active);

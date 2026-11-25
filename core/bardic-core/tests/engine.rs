@@ -23,6 +23,10 @@ struct FakeSpotify {
     calls: Mutex<Vec<String>>,
     state: Mutex<Option<PlaybackState>>,
     errors: Mutex<HashMap<&'static str, VecDeque<BardicError>>>,
+    /// `playback_state` captures the state at request start, then takes this long.
+    poll_delay_ms: Mutex<u64>,
+    /// Latency of every `set_volume` call.
+    volume_delay_ms: Mutex<u64>,
 }
 
 impl FakeSpotify {
@@ -80,8 +84,13 @@ fn dev(d: Option<&str>) -> &str {
 #[async_trait]
 impl SpotifyApi for FakeSpotify {
     async fn playback_state(&self, _t: &str) -> Result<Option<PlaybackState>> {
+        let captured = self.state.lock().unwrap().clone();
+        let delay = *self.poll_delay_ms.lock().unwrap();
+        if delay > 0 {
+            sleep(Duration::from_millis(delay)).await;
+        }
         self.record("playback_state", "playback_state".into())?;
-        Ok(self.state.lock().unwrap().clone())
+        Ok(captured)
     }
     async fn devices(&self, _t: &str) -> Result<Vec<Device>> {
         self.record("devices", "devices".into())?;
@@ -132,6 +141,10 @@ impl SpotifyApi for FakeSpotify {
         self.record("set_shuffle", format!("shuffle {on}"))
     }
     async fn set_volume(&self, _t: &str, _d: Option<&str>, p: u8) -> Result<()> {
+        let delay = *self.volume_delay_ms.lock().unwrap();
+        if delay > 0 {
+            sleep(Duration::from_millis(delay)).await;
+        }
         self.record("set_volume", format!("volume {p}"))?;
         if let Some(d) = self
             .state
@@ -157,12 +170,24 @@ impl SpotifyApi for FakeSpotify {
     }
 }
 
-struct StaticTokens;
+/// Hands out "tok0", then a new token after every `invalidate`.
+#[derive(Default)]
+struct TestTokens {
+    current: Mutex<u32>,
+    invalidated: Mutex<Vec<String>>,
+}
 
 #[async_trait]
-impl AccessTokenProvider for StaticTokens {
+impl AccessTokenProvider for TestTokens {
     async fn access_token(&self) -> Result<String> {
-        Ok("tok".into())
+        Ok(format!("tok{}", self.current.lock().unwrap()))
+    }
+    fn invalidate(&self, access_token: &str) {
+        self.invalidated
+            .lock()
+            .unwrap()
+            .push(access_token.to_string());
+        *self.current.lock().unwrap() += 1;
     }
 }
 
@@ -267,6 +292,7 @@ fn opts(
 
 struct Rig {
     api: Arc<FakeSpotify>,
+    tokens: Arc<TestTokens>,
     obs: Arc<RecObserver>,
     clock: MockClock,
     engine: Arc<Engine>,
@@ -276,15 +302,17 @@ fn rig() -> Rig {
     let api = Arc::new(FakeSpotify::default());
     let obs = Arc::new(RecObserver::default());
     let clock = MockClock::new(1_000_000);
+    let tokens = Arc::new(TestTokens::default());
     let engine = Engine::new(
         api.clone(),
-        Arc::new(StaticTokens),
+        tokens.clone(),
         Arc::new(clock.clone()),
         obs.clone(),
         EngineConfig::default(),
     );
     Rig {
         api,
+        tokens,
         obs,
         clock,
         engine,
@@ -561,7 +589,7 @@ async fn newer_play_supersedes_fade_in_progress() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn set_volume_cancels_fade() {
+async fn set_volume_interrupts_fade_but_cue_still_plays() {
     let r = rig();
     r.api
         .set_state(Some(playing("spotify:track:old", None, 80)));
@@ -578,8 +606,29 @@ async fn set_volume_cancels_fade() {
     r.engine.set_volume(55).await.unwrap();
     first.await.unwrap().unwrap();
     sleep(Duration::from_secs(5)).await;
-    assert_eq!(r.api.count("play "), 0);
-    assert_eq!(r.api.calls().last().unwrap(), "volume 55");
+    // The cue switch is not cancelled by the slider...
+    assert_eq!(r.api.count("play "), 1, "{:?}", r.api.calls());
+    assert_eq!(r.engine.state().active_cue_id, Some(1));
+    // ...but its remaining fade steps are: the user's volume wins and stays.
+    let calls = r.api.calls();
+    let user_at = calls.iter().position(|c| c == "volume 55").unwrap();
+    assert!(
+        calls[user_at + 1..]
+            .iter()
+            .all(|c| !c.starts_with("volume")),
+        "{calls:?}"
+    );
+    assert_eq!(r.engine.state().device.unwrap().volume_percent, Some(55));
+    // 55 is the new base: the next cue fades back up to it.
+    r.api.clear();
+    let b = cue(
+        2,
+        &[("spotify:track:b", 0)],
+        opts(RepeatMode::Off, false, None, 1500, 1500),
+    );
+    r.engine.play_cue(&b).await.unwrap();
+    assert_eq!(*r.api.volumes().last().unwrap(), 55);
+    assert!(r.obs.errors().is_empty());
 }
 
 #[tokio::test(start_paused = true)]
@@ -847,23 +896,26 @@ async fn poll_loop_honours_rate_limit() {
 async fn poll_loop_not_authenticated_reports_once_and_idles() {
     let r = rig();
     r.api.set_state(Some(playing("spotify:track:a", None, 50)));
-    for _ in 0..3 {
+    // Each poll retries once with a fresh token: 4 failures = 2 failed polls.
+    for _ in 0..4 {
         r.api.fail("playback_state", BardicError::NotAuthenticated);
     }
     let _handle = r.engine.spawn_poll_loop();
     sleep(Duration::from_millis(100)).await;
     assert_eq!(r.obs.errors(), vec!["not authenticated".to_string()]);
+    assert_eq!(r.api.count("playback_state"), 2);
     sleep(Duration::from_millis(4800)).await;
     assert_eq!(
         r.api.count("playback_state"),
-        1,
+        2,
         "idle interval while unauthenticated"
     );
-    sleep(Duration::from_millis(10_200)).await; // polls at 5s, 10s fail; 15s succeeds
-    assert_eq!(r.api.count("playback_state"), 4);
+    sleep(Duration::from_millis(5200)).await; // poll at 5s fails (2 calls); 10s succeeds
+    assert_eq!(r.api.count("playback_state"), 5);
     assert_eq!(r.obs.errors().len(), 1, "same error is not repeated");
+    assert_eq!(r.tokens.invalidated.lock().unwrap().len(), 2);
     sleep(Duration::from_millis(1000)).await;
-    assert_eq!(r.api.count("playback_state"), 5, "back to active interval");
+    assert_eq!(r.api.count("playback_state"), 6, "back to active interval");
 }
 
 // ------------------------------------------------------------------ misc transport
@@ -911,4 +963,466 @@ async fn transport_commands_update_state_and_report_errors() {
     r.api.fail("next", BardicError::Forbidden("premium".into()));
     assert!(r.engine.next().await.is_err());
     assert_eq!(r.obs.errors().len(), 1);
+}
+
+// ------------------------------------------------------------------ review fixes
+
+fn api_err() -> BardicError {
+    BardicError::Api {
+        status: 502,
+        message: "bad gateway".into(),
+    }
+}
+
+/// Rig whose engine has already polled `state` once (base volume known).
+async fn rig_with(state: PlaybackState) -> Rig {
+    let r = rig();
+    r.api.set_state(Some(state));
+    r.engine.refresh().await.unwrap();
+    r.api.clear();
+    r
+}
+
+fn paused(track: &str, vol: u8) -> PlaybackState {
+    PlaybackState {
+        is_playing: false,
+        ..playing(track, None, vol)
+    }
+}
+
+// #1 — errors after a fade-out restore the volume
+
+#[tokio::test(start_paused = true)]
+async fn play_error_after_fade_out_restores_volume() {
+    let r = rig_with(playing("spotify:track:old", None, 80)).await;
+    r.api.fail("play", api_err());
+    let c = cue(
+        1,
+        &[("spotify:track:new", 0)],
+        opts(RepeatMode::Off, false, None, 1500, 1500),
+    );
+    assert!(matches!(
+        r.engine.play_cue(&c).await,
+        Err(BardicError::Api { .. })
+    ));
+    let vols = r.api.volumes();
+    assert!(vols.contains(&0), "faded out first: {vols:?}");
+    assert_eq!(*vols.last().unwrap(), 80, "old track audible again");
+    assert_eq!(r.engine.state().device.unwrap().volume_percent, Some(80));
+    assert_eq!(r.obs.errors().len(), 1);
+
+    // Base volume intact: the next cue fades up to 80.
+    r.api.clear();
+    r.engine.play_cue(&c).await.unwrap();
+    assert_eq!(*r.api.volumes().last().unwrap(), 80);
+}
+
+#[tokio::test(start_paused = true)]
+async fn transfer_error_after_fade_out_restores_volume() {
+    let r = rig_with(playing("spotify:track:old", None, 80)).await;
+    // d1 is already active (no lazy transfer); play → NoActiveDevice → transfer fails.
+    r.engine.select_device(Some("d1".into()));
+    r.api.fail("play", BardicError::NoActiveDevice);
+    r.api.fail("transfer", api_err());
+    let c = cue(
+        1,
+        &[("spotify:track:new", 0)],
+        opts(RepeatMode::Off, false, None, 1500, 1500),
+    );
+    assert!(r.engine.play_cue(&c).await.is_err());
+    assert!(r.api.volumes().contains(&0));
+    assert_eq!(*r.api.volumes().last().unwrap(), 80);
+}
+
+#[tokio::test(start_paused = true)]
+async fn repeat_and_shuffle_failures_are_not_fatal() {
+    let r = rig_with(playing("spotify:track:old", None, 80)).await;
+    r.api.fail("set_repeat", api_err());
+    r.api
+        .fail("set_shuffle", BardicError::Restricted("nope".into()));
+    let c = cue(
+        1,
+        &[("spotify:track:new", 0)],
+        opts(RepeatMode::Track, false, Some(60), 1500, 1500),
+    );
+    r.engine.play_cue(&c).await.unwrap();
+    let calls = r.api.calls();
+    assert_eq!(r.api.count("play "), 1);
+    assert!(pos_of(&calls, "shuffle") > pos_of(&calls, "play "));
+    assert_eq!(*r.api.volumes().last().unwrap(), 60, "fade-in still runs");
+    assert_eq!(
+        r.obs.errors().len(),
+        2,
+        "both reported: {:?}",
+        r.obs.errors()
+    );
+    assert_eq!(r.engine.state().active_cue_id, Some(1));
+}
+
+#[tokio::test(start_paused = true)]
+async fn fade_out_and_pause_restores_volume_when_pause_fails() {
+    let r = rig_with(playing("spotify:track:x", None, 80)).await;
+    r.api
+        .fail("pause", BardicError::Forbidden("premium".into()));
+    assert!(matches!(
+        r.engine.fade_out_and_pause(1000).await,
+        Err(BardicError::Forbidden(_))
+    ));
+    assert_eq!(*r.api.volumes().last().unwrap(), 80);
+    assert_eq!(r.engine.state().device.unwrap().volume_percent, Some(80));
+}
+
+// #2 — pre-silence is engine-owned; stale/zero volumes are never adopted
+
+#[tokio::test(start_paused = true)]
+async fn failed_play_after_pre_silence_restores_and_never_adopts_zero() {
+    let r = rig_with(paused("spotify:track:old", 50)).await;
+    r.api.fail("play", api_err());
+    let c = cue(
+        1,
+        &[("spotify:track:new", 0)],
+        opts(RepeatMode::Off, false, None, 1500, 1500),
+    );
+    assert!(r.engine.play_cue(&c).await.is_err());
+    assert_eq!(r.api.volumes(), vec![0, 50]);
+
+    // Even if Spotify reports 0 later (e.g. muted elsewhere), 0 never becomes the base.
+    r.api
+        .edit_state(|s| s.device.as_mut().unwrap().volume_percent = Some(0));
+    r.engine.refresh().await.unwrap();
+    r.api.clear();
+    r.engine.play_cue(&c).await.unwrap();
+    assert_eq!(*r.api.volumes().last().unwrap(), 50);
+}
+
+#[tokio::test(start_paused = true)]
+async fn stale_poll_from_mid_fade_is_discarded() {
+    let r = rig_with(playing("spotify:track:old", None, 80)).await;
+    let a = cue(
+        1,
+        &[("spotify:track:a", 0)],
+        opts(RepeatMode::Off, false, None, 1500, 1500),
+    );
+    let engine = r.engine.clone();
+    let seq = tokio::spawn(async move { engine.play_cue(&a).await });
+    sleep(Duration::from_millis(400)).await;
+    let mid = r.engine.state().device.unwrap().volume_percent.unwrap();
+    assert!(mid > 0 && mid < 80, "mid-fade: {mid}");
+
+    // Poll issued mid-fade, answered long after the sequence ended.
+    *r.api.poll_delay_ms.lock().unwrap() = 5000;
+    let engine = r.engine.clone();
+    let poll = tokio::spawn(async move { engine.refresh().await });
+    seq.await.unwrap().unwrap();
+    assert_eq!(r.engine.state().device.unwrap().volume_percent, Some(80));
+    poll.await.unwrap().unwrap();
+    *r.api.poll_delay_ms.lock().unwrap() = 0;
+
+    let s = r.engine.state();
+    assert_eq!(s.device.unwrap().volume_percent, Some(80), "not {mid}");
+    assert_eq!(s.active_cue_id, Some(1));
+
+    // And the base volume is still 80: the next cue fades back up to it.
+    r.api.clear();
+    let b = cue(
+        2,
+        &[("spotify:track:b", 0)],
+        opts(RepeatMode::Off, false, None, 1500, 1500),
+    );
+    r.engine.play_cue(&b).await.unwrap();
+    assert_eq!(*r.api.volumes().last().unwrap(), 80);
+}
+
+// #3 — two cancellation scopes
+
+#[tokio::test(start_paused = true)]
+async fn pause_during_fade_in_restores_target_without_resuming() {
+    let r = rig_with(paused("spotify:track:old", 80)).await;
+    let c = cue(
+        1,
+        &[("spotify:track:new", 0)],
+        opts(RepeatMode::Off, false, Some(60), 1500, 0),
+    );
+    let engine = r.engine.clone();
+    let seq = tokio::spawn(async move { engine.play_cue(&c).await });
+    sleep(Duration::from_millis(500)).await;
+    assert_eq!(r.api.count("play "), 1);
+    r.engine.pause().await.unwrap();
+    seq.await.unwrap().unwrap();
+    sleep(Duration::from_secs(5)).await;
+
+    let calls = r.api.calls();
+    let pause_at = pos_of(&calls, "pause");
+    assert_eq!(&calls[pause_at + 1..], ["volume 60"], "{calls:?}");
+    assert_eq!(r.api.count("resume"), 0);
+    let s = r.engine.state();
+    assert!(!s.is_playing);
+    assert_eq!(s.device.unwrap().volume_percent, Some(60));
+    assert!(r.obs.errors().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn pause_during_cue_fade_out_still_switches_cue() {
+    let r = rig_with(playing("spotify:track:old", None, 80)).await;
+    let c = cue(
+        1,
+        &[("spotify:track:new", 0)],
+        opts(RepeatMode::Off, false, None, 1500, 1500),
+    );
+    let engine = r.engine.clone();
+    let seq = tokio::spawn(async move { engine.play_cue(&c).await });
+    sleep(Duration::from_millis(300)).await;
+    r.engine.pause().await.unwrap();
+    seq.await.unwrap().unwrap();
+    let calls = r.api.calls();
+    // pause restores the pre-fade volume; the cue still plays, at its target directly.
+    let pause_at = pos_of(&calls, "pause");
+    assert_eq!(calls[pause_at + 1], "volume 80", "{calls:?}");
+    assert!(pos_of(&calls, "play ") > pause_at);
+    assert_eq!(*r.api.volumes().last().unwrap(), 80);
+    assert_eq!(r.engine.state().active_cue_id, Some(1));
+}
+
+// #7 — 401 → invalidate + retry once
+
+#[tokio::test(start_paused = true)]
+async fn not_authenticated_invalidates_token_and_retries_once() {
+    let r = rig_with(playing("spotify:track:x", None, 50)).await;
+    r.api.fail("pause", BardicError::NotAuthenticated);
+    r.engine.pause().await.unwrap();
+    assert_eq!(r.api.count("pause"), 2);
+    assert_eq!(*r.tokens.invalidated.lock().unwrap(), vec!["tok0"]);
+    assert!(r.obs.errors().is_empty());
+
+    // A second 401 in a row is surfaced (no endless retry).
+    r.api.fail("next", BardicError::NotAuthenticated);
+    r.api.fail("next", BardicError::NotAuthenticated);
+    assert!(matches!(
+        r.engine.next().await,
+        Err(BardicError::NotAuthenticated)
+    ));
+    assert_eq!(r.api.count("next"), 2);
+    assert_eq!(*r.tokens.invalidated.lock().unwrap(), vec!["tok0", "tok1"]);
+
+    // Inside a play sequence too.
+    r.api.clear();
+    r.api.fail("play", BardicError::NotAuthenticated);
+    let c = cue(
+        1,
+        &[("spotify:track:a", 0)],
+        opts(RepeatMode::Off, false, None, 0, 0),
+    );
+    r.engine.play_cue(&c).await.unwrap();
+    assert_eq!(r.api.count("play "), 2);
+}
+
+// #9 — Restricted pause/resume is a no-op
+
+#[tokio::test(start_paused = true)]
+async fn restricted_pause_and_resume_are_noops() {
+    let r = rig_with(paused("spotify:track:x", 50)).await;
+    r.api
+        .fail("pause", BardicError::Restricted("already paused".into()));
+    r.engine.pause().await.unwrap();
+    assert!(!r.engine.state().is_playing);
+    r.api
+        .fail("resume", BardicError::Restricted("already playing".into()));
+    r.engine.resume().await.unwrap();
+    assert!(r.engine.state().is_playing);
+    r.api
+        .fail("pause", BardicError::Restricted("already paused".into()));
+    r.engine.fade_out_and_pause(1000).await.unwrap();
+    assert!(r.obs.errors().is_empty());
+    // Forbidden (Premium) is still an error.
+    r.api
+        .fail("pause", BardicError::Forbidden("premium".into()));
+    assert!(r.engine.pause().await.is_err());
+}
+
+// #10 — modes before play for contexts, cap on uris
+
+#[tokio::test(start_paused = true)]
+async fn context_play_sets_repeat_and_shuffle_before_play() {
+    let r = rig_with(playing("spotify:track:x", None, 50)).await;
+    let c = cue(
+        1,
+        &[("spotify:playlist:forest", 0)],
+        opts(RepeatMode::Context, true, None, 0, 0),
+    );
+    r.engine.play_cue(&c).await.unwrap();
+    let calls = r.api.calls();
+    assert!(pos_of(&calls, "repeat context") < pos_of(&calls, "shuffle true"));
+    assert!(pos_of(&calls, "shuffle true") < pos_of(&calls, "play context="));
+    assert_eq!(r.api.count("shuffle"), 1);
+    let s = r.engine.state();
+    assert!(s.shuffle);
+    assert_eq!(s.repeat, RepeatMode::Context);
+}
+
+#[tokio::test(start_paused = true)]
+async fn context_modes_failing_before_play_are_retried_after() {
+    let r = rig();
+    r.api.fail("set_shuffle", BardicError::NoActiveDevice);
+    let c = cue(
+        1,
+        &[("spotify:album:a", 0)],
+        opts(RepeatMode::Off, true, None, 0, 0),
+    );
+    r.engine.play_cue(&c).await.unwrap();
+    let calls = r.api.calls();
+    let shuffles: Vec<usize> = calls
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.starts_with("shuffle"))
+        .map(|(i, _)| i)
+        .collect();
+    let play_at = pos_of(&calls, "play ");
+    assert_eq!(shuffles.len(), 2, "{calls:?}");
+    assert!(shuffles[0] < play_at && shuffles[1] > play_at);
+    assert_eq!(r.api.count("repeat"), 1, "repeat succeeded the first time");
+    assert!(r.obs.errors().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn track_list_is_capped_at_100_uris() {
+    let r = rig();
+    let uris: Vec<String> = (0..150).map(|i| format!("spotify:track:t{i}")).collect();
+    let items: Vec<(&str, u32)> = uris.iter().map(|u| (u.as_str(), 0)).collect();
+    let c = cue(1, &items, opts(RepeatMode::Off, false, None, 0, 0));
+    r.engine.play_cue(&c).await.unwrap();
+    let calls = r.api.calls();
+    let play = &calls[pos_of(&calls, "play ")];
+    let list = play
+        .strip_prefix("play uris=")
+        .unwrap()
+        .split(' ')
+        .next()
+        .unwrap();
+    assert_eq!(list.split(',').count(), 100);
+    assert!(list.starts_with("spotify:track:t0,"));
+}
+
+// #11 — fade schedule
+
+#[tokio::test(start_paused = true)]
+async fn fade_steps_are_clamped_to_volume_distance() {
+    let r = rig_with(playing("spotify:track:x", None, 3)).await;
+    r.engine.fade_out_and_pause(1500).await.unwrap();
+    assert_eq!(r.api.volumes(), vec![2, 1, 0, 3]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn fade_duration_does_not_grow_with_latency() {
+    let r = rig_with(playing("spotify:track:x", None, 80)).await;
+    *r.api.volume_delay_ms.lock().unwrap() = 100;
+    let t0 = Instant::now();
+    r.engine.fade_out_and_pause(1500).await.unwrap();
+    let elapsed = t0.elapsed();
+    assert_eq!(r.api.volumes(), vec![70, 60, 50, 40, 30, 20, 10, 0, 80]);
+    // fade 1500 ms + last step's latency + restore latency; sequential sleeps would be ~2.3 s.
+    assert!(
+        elapsed >= Duration::from_millis(1600) && elapsed <= Duration::from_millis(1750),
+        "{elapsed:?}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn rate_limited_fade_waits_capped_and_records_base_only_on_success() {
+    let r = rig_with(playing("spotify:track:old", None, 80)).await;
+    r.api.fail(
+        "set_volume",
+        BardicError::RateLimited {
+            retry_after_secs: 30,
+        },
+    );
+    r.api.fail("set_volume", api_err()); // the jump to the target fails too
+    let c = cue(
+        1,
+        &[("spotify:track:new", 0)],
+        opts(RepeatMode::Off, false, Some(40), 1500, 0),
+    );
+    let t0 = Instant::now();
+    r.engine.play_cue(&c).await.unwrap();
+    let elapsed = t0.elapsed();
+    assert!(
+        elapsed >= Duration::from_secs(2) && elapsed < Duration::from_millis(2100),
+        "retry_after capped at 2 s: {elapsed:?}"
+    );
+    assert_eq!(r.api.volumes(), vec![75, 40]);
+    // 40 was never confirmed → base stays 80.
+    r.api.clear();
+    let b = cue(
+        2,
+        &[("spotify:track:b", 0)],
+        opts(RepeatMode::Off, false, None, 0, 0),
+    );
+    r.engine.play_cue(&b).await.unwrap();
+    assert_eq!(r.api.volumes(), vec![80]);
+}
+
+// #12 — stale poll vs transport
+
+#[tokio::test(start_paused = true)]
+async fn stale_poll_does_not_overwrite_newer_transport_state() {
+    let r = rig_with(paused("spotify:track:x", 50)).await;
+    *r.api.poll_delay_ms.lock().unwrap() = 500;
+    let engine = r.engine.clone();
+    let poll = tokio::spawn(async move { engine.refresh().await });
+    sleep(Duration::from_millis(100)).await;
+    r.engine.resume().await.unwrap();
+    r.engine.set_repeat(RepeatMode::Track).await.unwrap();
+    poll.await.unwrap().unwrap();
+    let s = r.engine.state();
+    assert!(s.is_playing, "stale 'paused' snapshot was applied");
+    assert_eq!(s.repeat, RepeatMode::Track);
+
+    // A poll that doesn't race anything is applied as usual.
+    *r.api.poll_delay_ms.lock().unwrap() = 0;
+    r.api.edit_state(|s| {
+        s.is_playing = true;
+        s.repeat = RepeatMode::Track;
+        s.track_uri = Some("spotify:track:y".into());
+    });
+    let s = r.engine.refresh().await.unwrap();
+    assert_eq!(s.track_uri.as_deref(), Some("spotify:track:y"));
+}
+
+// nice-to-haves
+
+#[tokio::test(start_paused = true)]
+async fn freshly_transferred_device_gets_a_second_play_attempt() {
+    let r = rig_with(playing("spotify:track:x", None, 50)).await;
+    r.engine.select_device(Some("d2".into()));
+    r.api.fail("play", BardicError::NoActiveDevice);
+    let c = cue(
+        1,
+        &[("spotify:track:a", 0)],
+        opts(RepeatMode::Off, false, None, 0, 0),
+    );
+    let t0 = Instant::now();
+    r.engine.play_cue(&c).await.unwrap();
+    assert!(t0.elapsed() >= Duration::from_millis(500));
+    let calls = r.api.calls();
+    assert_eq!(calls[0], "transfer d2 play=false");
+    assert_eq!(r.api.count("transfer"), 1);
+    assert_eq!(r.api.count("play "), 2);
+    assert!(r.obs.errors().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn reset_forgets_cached_state() {
+    let r = rig_with(playing("spotify:track:x", None, 50)).await;
+    let c = cue(
+        1,
+        &[("spotify:track:a", 0)],
+        opts(RepeatMode::Off, false, None, 0, 0),
+    );
+    r.engine.play_cue(&c).await.unwrap();
+    assert_eq!(r.engine.state().active_cue_id, Some(1));
+    r.engine.reset();
+    assert_eq!(r.engine.state(), PlaybackState::default());
+    // The next play re-reads Spotify first.
+    r.api.clear();
+    r.engine.play_cue(&c).await.unwrap();
+    assert_eq!(r.api.calls()[0], "playback_state");
 }
