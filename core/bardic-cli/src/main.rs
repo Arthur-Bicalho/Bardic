@@ -41,7 +41,8 @@ Resolve / play   (context flags: --campaign ID --chapter ID --scene ID)
   ambience <env_id> [--emotion ID]
 
 Spotify   (needs BARDIC_CLIENT_ID)
-  login | logout | status | devices [--select ID] | search <query>
+  login | logout | status | devices | search <query>
+  (any playback command accepts --device ID to play on / transfer to that device)
   pause | resume | next | prev | silence [ms] | loop <off|track|context>
   shuffle <on|off> | volume <0-100> | watch      (watch = live poll, Ctrl+C to stop)
 ";
@@ -90,19 +91,26 @@ struct Args {
 }
 
 impl Args {
-    fn parse(raw: &[String]) -> Self {
+    fn parse(raw: &[String]) -> Result<Self, BardicError> {
         const SWITCHES: &[&str] = &["--shuffle"];
         let (mut positional, mut flags) = (Vec::new(), Vec::new());
         let mut it = raw.iter();
         while let Some(a) = it.next() {
             if a.starts_with("--") {
-                let val = if SWITCHES.contains(&a.as_str()) { None } else { it.next().cloned() };
+                let val = if SWITCHES.contains(&a.as_str()) {
+                    None
+                } else {
+                    match it.next() {
+                        Some(v) if !v.starts_with("--") => Some(v.clone()),
+                        _ => return Err(BardicError::Invalid(format!("{a} needs a value"))),
+                    }
+                };
                 flags.push((a.clone(), val));
             } else {
                 positional.push(a.clone());
             }
         }
-        Self { positional, flags }
+        Ok(Self { positional, flags })
     }
     fn pos(&self, i: usize, name: &str) -> Result<&str, BardicError> {
         self.positional
@@ -208,7 +216,7 @@ async fn wait_for_callback() -> Result<String, BardicError> {
 async fn run(cmd: &str, args: Args) -> Result<(), BardicError> {
     let client_id = std::env::var("BARDIC_CLIENT_ID").unwrap_or_default();
     let config = CoreConfig {
-        db_path: Some(data_dir().join("bardic.db")),
+        db_path: Some(data_dir().join("bardic.db").to_string_lossy().into_owned()),
         auth: AuthConfig::new(client_id.clone(), loopback_redirect_uri(LOGIN_PORT)),
         engine: EngineConfig::default(),
     };
@@ -221,6 +229,9 @@ async fn run(cmd: &str, args: Args) -> Result<(), BardicError> {
     );
     if needs_spotify && client_id.is_empty() {
         return Err(BardicError::Invalid("set BARDIC_CLIENT_ID to your Spotify app's Client ID".into()));
+    }
+    if let Some(device) = args.flag("--device") {
+        core.engine().select_device(Some(device.to_string()));
     }
 
     match cmd {
@@ -347,9 +358,6 @@ async fn run(cmd: &str, args: Args) -> Result<(), BardicError> {
         }
         "status" => println!("{}", describe(&core.engine().refresh().await?)),
         "devices" => {
-            if let Some(id) = args.flag("--select") {
-                core.engine().select_device(Some(id.to_string()));
-            }
             for d in core.engine().devices().await? {
                 println!("{} {} [{}] id={}", if d.is_active { "*" } else { " " }, d.name, d.device_type, d.id);
             }
@@ -408,7 +416,7 @@ async fn main() {
         print!("{USAGE}");
         return;
     };
-    if let Err(e) = run(cmd, Args::parse(rest)).await {
+    if let Err(e) = async { run(cmd, Args::parse(rest)?).await }.await {
         eprintln!("error: {e}");
         std::process::exit(1);
     }
