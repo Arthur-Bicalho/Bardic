@@ -127,6 +127,17 @@ impl BardicCore {
         self.auth.complete_login(callback_url).await
     }
 
+    /// Android: persist this (encrypted — it holds the PKCE verifier) right after
+    /// `login_url()`, so a login survives the process being killed behind the Custom Tab.
+    pub fn export_pending_login(&self) -> Option<String> {
+        self.auth.export_pending()
+    }
+
+    /// Android: restore the saved pending login before `complete_login` on a cold start.
+    pub fn restore_pending_login(&self, saved: &str) -> Result<()> {
+        self.auth.restore_pending(saved)
+    }
+
     pub fn is_logged_in(&self) -> bool {
         self.auth.is_logged_in()
     }
