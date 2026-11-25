@@ -13,7 +13,10 @@ use bardic_core::model::{
     Trigger,
 };
 use bardic_core::{BardicCore, BardicError, CoreConfig};
+use std::time::Duration;
+
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 
 const LOGIN_PORT: u16 = 43821;
 
@@ -180,28 +183,117 @@ fn parse_repeat(s: &str) -> Result<RepeatMode, BardicError> {
     }
 }
 
-/// One-shot loopback HTTP listener for the OAuth redirect.
-async fn wait_for_callback() -> Result<String, BardicError> {
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", LOGIN_PORT))
+/// Overall time allowed for the browser round trip.
+const LOGIN_DEADLINE: Duration = Duration::from_secs(5 * 60);
+/// Per-connection budget for reading the request line and writing the answer.
+const CONN_TIMEOUT: Duration = Duration::from_secs(5);
+/// Max bytes read before the request line must be complete.
+const MAX_REQUEST_LINE: usize = 8 * 1024;
+
+/// Bind the loopback listener for the OAuth redirect. Done before printing the login URL
+/// so the redirect can't arrive before we listen (or reach another process on the port).
+async fn bind_callback_listener() -> Result<TcpListener, BardicError> {
+    TcpListener::bind(("127.0.0.1", LOGIN_PORT))
         .await
-        .map_err(|e| BardicError::Network(format!("cannot listen on port {LOGIN_PORT}: {e}")))?;
+        .map_err(|e| BardicError::Network(format!("cannot listen on port {LOGIN_PORT}: {e}")))
+}
+
+fn bad_data(msg: &str) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, msg.to_string())
+}
+
+/// Read up to the end of the HTTP request line (`\r\n`), capped at `MAX_REQUEST_LINE`.
+async fn read_request_line(sock: &mut TcpStream) -> std::io::Result<String> {
+    let mut buf = Vec::with_capacity(1024);
+    let mut chunk = [0u8; 1024];
     loop {
-        let (mut sock, _) = listener.accept().await.map_err(|e| BardicError::Network(e.to_string()))?;
-        let mut buf = vec![0u8; 8192];
-        let n = sock.read(&mut buf).await.map_err(|e| BardicError::Network(e.to_string()))?;
-        let req = String::from_utf8_lossy(&buf[..n]);
-        let path = req.lines().next().and_then(|l| l.split_whitespace().nth(1)).unwrap_or("");
-        if !path.starts_with("/callback") {
-            let _ = sock.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n").await;
+        if let Some(end) = buf.windows(2).position(|w| w == b"\r\n") {
+            buf.truncate(end);
+            return String::from_utf8(buf).map_err(|_| bad_data("non-UTF-8 request line"));
+        }
+        if buf.len() >= MAX_REQUEST_LINE {
+            return Err(bad_data("request line too long"));
+        }
+        let n = sock.read(&mut chunk).await?;
+        if n == 0 {
+            return Err(bad_data("connection closed before request line"));
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
+}
+
+async fn respond(sock: &mut TcpStream, status: &str, body: &str) {
+    let resp = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let write = async {
+        sock.write_all(resp.as_bytes()).await?;
+        sock.shutdown().await
+    };
+    match tokio::time::timeout(CONN_TIMEOUT, write).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => eprintln!("login: could not answer browser request: {e}"),
+        Err(_) => eprintln!("login: timed out answering browser request"),
+    }
+}
+
+fn page(title: &str, text: &str) -> String {
+    format!("<html><body style=\"font-family:sans-serif\"><h2>{title}</h2>{text}</body></html>")
+}
+
+/// Serve the loopback redirect until a callback completes the login. Requests for other
+/// paths get 404; callbacks with a missing/wrong `state` get 400 and we keep waiting (so a
+/// stray or forged request can't end the login). Success is only shown after the token
+/// exchange succeeded. Connections are handled one at a time, each with a short timeout.
+async fn wait_for_callback(listener: TcpListener, core: &BardicCore) -> Result<(), BardicError> {
+    let deadline = tokio::time::Instant::now() + LOGIN_DEADLINE;
+    loop {
+        let accepted = tokio::time::timeout_at(deadline, listener.accept())
+            .await
+            .map_err(|_| BardicError::Auth("login timed out; run `bardic login` again".into()))?;
+        let mut sock = match accepted {
+            Ok((sock, _)) => sock,
+            Err(e) => {
+                eprintln!("login: accept failed: {e}");
+                continue;
+            }
+        };
+        let line = match tokio::time::timeout(CONN_TIMEOUT, read_request_line(&mut sock)).await {
+            Ok(Ok(line)) => line,
+            Ok(Err(e)) => {
+                eprintln!("login: ignoring bad request: {e}");
+                continue;
+            }
+            Err(_) => {
+                eprintln!("login: ignoring connection that sent no request in time");
+                continue;
+            }
+        };
+        let mut parts = line.split(' ');
+        let (method, target) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
+        let path = target.split('?').next().unwrap_or("");
+        if method != "GET" || path != "/callback" {
+            respond(&mut sock, "404 Not Found", &page("Not found", "")).await;
             continue;
         }
-        let body = "<html><body style=\"font-family:sans-serif\"><h2>Bardic is connected.</h2>You can close this tab.</body></html>";
-        let resp = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            body.len()
-        );
-        let _ = sock.write_all(resp.as_bytes()).await;
-        return Ok(path.to_string());
+        match core.complete_login(target).await {
+            Ok(()) => {
+                respond(&mut sock, "200 OK", &page("Bardic is connected.", "You can close this tab.")).await;
+                return Ok(());
+            }
+            Err(BardicError::Auth(m)) if m == "state mismatch" => {
+                eprintln!("login: ignoring callback with missing or wrong state");
+                let text = "This link does not belong to the current login.";
+                respond(&mut sock, "400 Bad Request", &page("Invalid login request", text)).await;
+            }
+            Err(e) => {
+                let text = "Return to the terminal for details.";
+                respond(&mut sock, "200 OK", &page("Bardic login failed.", text)).await;
+                return Err(e);
+            }
+        }
     }
 }
 
@@ -335,10 +427,10 @@ async fn run(cmd: &str, args: Args) -> Result<(), BardicError> {
         "ambience" => core.play_environment(parse_id(args.pos(0, "env_id")?)?, args.id_flag("--emotion")?).await?,
         // ------------------------------------------------ spotify
         "login" => {
+            let listener = bind_callback_listener().await?;
             let url = core.login_url()?;
             println!("Open this URL to log in to Spotify:\n\n{url}\n\nWaiting for the redirect on port {LOGIN_PORT}…");
-            let callback = wait_for_callback().await?;
-            core.complete_login(&callback).await?;
+            wait_for_callback(listener, &core).await?;
             println!("Logged in.");
         }
         "logout" => {
