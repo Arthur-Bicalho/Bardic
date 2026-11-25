@@ -122,6 +122,9 @@ pub trait TokenStore: Send + Sync {
 #[async_trait]
 pub trait AccessTokenProvider: Send + Sync {
     async fn access_token(&self) -> Result<String>;
+    /// Spotify rejected `access_token` with 401: forget it so the next `access_token()`
+    /// refreshes. Callers retry the request once. Default: no-op.
+    fn invalidate(&self, _access_token: &str) {}
 }
 
 /// In-memory store (tests, ephemeral sessions).
