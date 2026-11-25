@@ -9,14 +9,17 @@
 //! - `auth`     — OAuth 2.0 PKCE + token lifecycle
 //! - `spotify`  — `SpotifyApi` trait + reqwest implementation
 //! - `engine`   — playback state machine, poll loop, fades
+//! - `facade`   — `BardicCore`, the one object UIs use
 
 pub mod auth;
 pub mod clock;
 pub mod db;
 pub mod engine;
 pub mod error;
+pub mod facade;
 pub mod model;
 pub mod resolver;
 pub mod spotify;
 
 pub use error::{BardicError, Result};
+pub use facade::{BardicCore, CoreConfig};

@@ -11,6 +11,6 @@ path = "src/main.rs"
 
 [dependencies]
 bardic-core = { workspace = true, features = ["keyring-store"] }
-tokio.workspace = true
+tokio = { workspace = true, features = ["signal"] }
 serde_json.workspace = true
 tracing-subscriber.workspace = true

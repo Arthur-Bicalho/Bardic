@@ -84,7 +84,8 @@ fn resolve_cue(input: &ResolverInput, t: Trigger) -> Option<Resolution> {
     None
 }
 
-fn ambience_options() -> CueOptions {
+/// Playback options used for every ambience (endless shuffled loop).
+pub fn ambience_options() -> CueOptions {
     CueOptions {
         repeat: RepeatMode::Context,
         shuffle: true,
