@@ -245,6 +245,9 @@ pub enum MatchKind {
     SituationOnly,
     /// Request had both tags; cue matches the emotion and has no situation.
     EmotionOnly,
+    /// Request had ONE tag; cue has that tag plus another one
+    /// (e.g. "Combat" pad plays a "Combat + Tension" cue when no plain Combat cue exists).
+    Partial,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

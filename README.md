@@ -67,5 +67,6 @@ When you tap a situation and/or emotion, Bardic looks for a cue in this order:
 
 1. exact match (same situation **and** emotion) at scene → chapter → campaign → global level;
 2. if you tapped both tags: situation-only cues, then emotion-only cues, same level order;
+   if you tapped one tag: cues that have that tag plus another one (e.g. Combat pad → "Combat + Tension" cue);
 3. ambience of the scene/chapter/campaign default environment, then the global default;
 4. otherwise nothing plays.

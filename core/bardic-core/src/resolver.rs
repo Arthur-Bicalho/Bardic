@@ -8,6 +8,7 @@
 //!    (a `None` in the trigger must match `None` on the cue).
 //!    b. If the trigger has BOTH tags: SituationOnly (cue situation matches, cue emotion None).
 //!    c. If the trigger has BOTH tags: EmotionOnly (cue emotion matches, cue situation None).
+//!    d. If the trigger has exactly ONE tag: Partial (cue has that tag and any value for the other).
 //!    Within a level, lowest `position` then lowest `id` wins. Cues with no items are skipped.
 //! 3. Ambience fallback: first default environment set among scene → chapter → campaign → global
 //!    (`FallbackLevel` reports which). Tracks of that environment ordered by position; if the
@@ -57,6 +58,8 @@ fn resolve_cue(input: &ResolverInput, t: Trigger) -> Option<Resolution> {
     if both {
         passes.push(MatchKind::SituationOnly);
         passes.push(MatchKind::EmotionOnly);
+    } else if t.situation_id.is_some() || t.emotion_id.is_some() {
+        passes.push(MatchKind::Partial);
     }
     for pass in passes {
         let best = input
@@ -71,6 +74,11 @@ fn resolve_cue(input: &ResolverInput, t: Trigger) -> Option<Resolution> {
                     c.situation_id == t.situation_id && c.emotion_id.is_none()
                 }
                 MatchKind::EmotionOnly => c.emotion_id == t.emotion_id && c.situation_id.is_none(),
+                MatchKind::Partial => match (t.situation_id, t.emotion_id) {
+                    (Some(s), None) => c.situation_id == Some(s),
+                    (None, Some(e)) => c.emotion_id == Some(e),
+                    _ => false,
+                },
             })
             .filter_map(|c| level_rank(c.owner, &input.context).map(|r| (r, c)))
             .min_by_key(|(rank, c)| (*rank, c.position, c.id));
@@ -299,17 +307,28 @@ mod tests {
     }
 
     #[test]
-    fn single_tag_trigger_requires_none_on_other_tag() {
+    fn single_tag_trigger_prefers_exact_then_partial() {
         let cues = vec![
             cue(1, CueOwner::Scene(SCENE), Some(COMBAT), Some(DREAD), 0),
             cue(2, CueOwner::Global, Some(COMBAT), None, 0),
         ];
-        // Situation-only trigger: cue 1 has an emotion, so only cue 2 is Exact.
+        // Situation-only trigger: an exact (no-emotion) cue anywhere beats a partial one.
         let r = resolve(&input(cues.clone()), trig(Some(COMBAT), None));
         assert_eq!(cue_id(&r), (2, MatchKind::Exact));
-        // Emotion-only trigger: no cue has emotion DREAD with no situation, no partial passes.
-        let r = resolve(&input(cues), trig(None, Some(DREAD)));
-        assert_eq!(r, Resolution::Nothing);
+        // Emotion-only trigger: no exact cue, so the Combat+Dread cue matches partially.
+        let r = resolve(&input(cues.clone()), trig(None, Some(DREAD)));
+        assert_eq!(cue_id(&r), (1, MatchKind::Partial));
+        // Without the exact cue, the situation trigger also falls back to the partial cue.
+        let r = resolve(&input(vec![cues[0].clone()]), trig(Some(COMBAT), None));
+        assert_eq!(cue_id(&r), (1, MatchKind::Partial));
+    }
+
+    #[test]
+    fn both_tag_trigger_never_uses_partial() {
+        // Combat+Tension must not pick a Combat+Dread cue.
+        let cues = vec![cue(1, CueOwner::Scene(SCENE), Some(COMBAT), Some(DREAD), 0)];
+        let r = resolve(&input(cues), trig(Some(COMBAT), Some(TENSION)));
+        assert!(!matches!(r, Resolution::Cue { .. }));
     }
 
     #[test]
