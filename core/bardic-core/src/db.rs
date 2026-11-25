@@ -5,6 +5,7 @@
 //! cue items, ambience tracks and layers, or nulls references (default
 //! environments, cue tags).
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 
@@ -167,7 +168,14 @@ const SEED_ENVIRONMENTS: &[(&str, &str, &str)] = &[
     ("Snow", "snowflake", "#B0BEC5"),
 ];
 
-const CAMPAIGN_COLS: &str = "id, name, description, default_environment_id, position";
+/// Owner filter for the cues applicable to a context. Takes the campaign, chapter
+/// and scene ids as parameters 1..=3 (NULL when the level is absent).
+const APPLICABLE_CUES_WHERE: &str = "owner_level = 'global' \
+     OR (owner_level = 'campaign' AND campaign_id = ?1) \
+     OR (owner_level = 'chapter' AND chapter_id = ?2) \
+     OR (owner_level = 'scene' AND scene_id = ?3)";
+
+const CAMPAIGN_COLS: &str ="id, name, description, default_environment_id, position";
 const CHAPTER_COLS: &str =
     "id, campaign_id, name, description, default_environment_id, position";
 const SCENE_COLS: &str = "id, chapter_id, name, description, default_environment_id, position";
@@ -393,11 +401,32 @@ impl Library {
         expect_one(n, "tag", t.id)
     }
 
-    /// Cues referencing the tag keep existing with the tag cleared (ON DELETE SET NULL).
+    /// Deletes a tag, in one transaction, and fixes up everything that referenced it:
+    ///
+    /// - A cue whose only tag this is is **deleted**. Left with no tags it could
+    ///   never match a playback context, so keeping it would be silently useless.
+    /// - A cue with another tag left keeps that tag; this tag's column is set to NULL.
+    /// - Ambience tracks that used it as their emotion just get NULL. They still
+    ///   belong to their environment.
+    ///
+    /// A missing tag is `NotFound` and changes nothing.
     pub fn delete_tag(&self, id: Id) -> Result<()> {
-        let conn = self.lock()?;
-        let n = conn.execute("DELETE FROM tags WHERE id = ?1", params![id])?;
-        expect_one(n, "tag", id)
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        // Cues whose other tag column is empty would be left with no tags: drop them.
+        tx.execute(
+            "DELETE FROM cues WHERE (situation_id = ?1 AND emotion_id IS NULL) \
+             OR (emotion_id = ?1 AND situation_id IS NULL)",
+            params![id],
+        )?;
+        // Every remaining cue still has its other tag, so just clear this column.
+        tx.execute("UPDATE cues SET situation_id = NULL WHERE situation_id = ?1", params![id])?;
+        tx.execute("UPDATE cues SET emotion_id = NULL WHERE emotion_id = ?1", params![id])?;
+        // Ambience tracks are handled by the schema's ON DELETE SET NULL.
+        let n = tx.execute("DELETE FROM tags WHERE id = ?1", params![id])?;
+        expect_one(n, "tag", id)?;
+        tx.commit()?;
+        Ok(())
     }
 
     // ------------------------------------------------------------ cues
@@ -413,6 +442,8 @@ impl Library {
     ) -> Result<Cue> {
         check_cue_options(options)?;
         let conn = self.lock()?;
+        check_tag_kind(&conn, situation_id, TagKind::Situation)?;
+        check_tag_kind(&conn, emotion_id, TagKind::Emotion)?;
         let (level, campaign, chapter, scene) = owner_parts(owner);
         let position = next_position(
             &conn,
@@ -460,6 +491,8 @@ impl Library {
     pub fn update_cue(&self, cue: &Cue) -> Result<()> {
         check_cue_options(&cue.options)?;
         let conn = self.lock()?;
+        check_tag_kind(&conn, cue.situation_id, TagKind::Situation)?;
+        check_tag_kind(&conn, cue.emotion_id, TagKind::Emotion)?;
         let o = &cue.options;
         let n = conn.execute(
             "UPDATE cues SET name = ?1, situation_id = ?2, emotion_id = ?3, repeat_mode = ?4, \
@@ -624,6 +657,7 @@ impl Library {
         emotion_id: Option<Id>,
     ) -> Result<AmbienceTrack> {
         let conn = self.lock()?;
+        check_tag_kind(&conn, emotion_id, TagKind::Emotion)?;
         let position = next_position(
             &conn,
             "SELECT COALESCE(MAX(position) + 1, 0) FROM ambience_tracks WHERE environment_id = ?1",
@@ -658,6 +692,21 @@ impl Library {
     pub fn list_ambience_tracks(&self, environment_id: Option<Id>) -> Result<Vec<AmbienceTrack>> {
         let conn = self.lock()?;
         list_ambience_on(&conn, environment_id)
+    }
+
+    /// Ids of the environments that have at least one Spotify ambience track
+    /// (local layers do not count), ordered by environment position. Lets the UI
+    /// warn about ambiences with nothing to play.
+    pub fn environments_with_tracks(&self) -> Result<Vec<Id>> {
+        let conn = self.lock()?;
+        query_all(
+            &conn,
+            "SELECT id FROM environments e WHERE EXISTS \
+             (SELECT 1 FROM ambience_tracks t WHERE t.environment_id = e.id) \
+             ORDER BY e.position, e.id",
+            [],
+            |r: &Row<'_>| Ok(r.get::<_, Id>(0)?),
+        )
     }
 
     pub fn remove_ambience_track(&self, id: Id) -> Result<()> {
@@ -801,24 +850,13 @@ impl Library {
             campaign_default_env = campaign.default_environment_id;
         }
 
-        let mut cues = list_cues_on(&conn, CueOwner::Global)?;
-        if let Some(id) = context.campaign_id {
-            cues.extend(list_cues_on(&conn, CueOwner::Campaign(id))?);
-        }
-        if let Some(id) = context.chapter_id {
-            cues.extend(list_cues_on(&conn, CueOwner::Chapter(id))?);
-        }
-        if let Some(id) = context.scene_id {
-            cues.extend(list_cues_on(&conn, CueOwner::Scene(id))?);
-        }
-
         Ok(ResolverInput {
             context,
             scene_default_env,
             chapter_default_env,
             campaign_default_env,
             global_default_env: global_default_on(&conn)?,
-            cues,
+            cues: applicable_cues(&conn, &context)?,
             ambience: list_ambience_on(&conn, None)?,
         })
     }
@@ -990,6 +1028,59 @@ fn list_cues_on(conn: &Connection, owner: CueOwner) -> Result<Vec<Cue>> {
         |r: &Row<'_>| Ok(r.get::<_, Id>(0)?),
     )?;
     ids.into_iter().map(|id| load_cue(conn, id)).collect()
+}
+
+/// Fails unless `tag_id` (when set) names an existing tag of `kind`.
+fn check_tag_kind(conn: &Connection, tag_id: Option<Id>, kind: TagKind) -> Result<()> {
+    let Some(id) = tag_id else {
+        return Ok(());
+    };
+    let found: Option<String> = conn
+        .query_row("SELECT kind FROM tags WHERE id = ?1", params![id], |r| r.get(0))
+        .optional()?;
+    match found {
+        None => Err(BardicError::NotFound(format!("tag {id}"))),
+        Some(k) if k == kind.as_str() => Ok(()),
+        Some(_) => Err(BardicError::Invalid(match kind {
+            TagKind::Situation => format!("tag {id} is not a situation"),
+            TagKind::Emotion => format!("tag {id} is not an emotion"),
+        })),
+    }
+}
+
+/// Cues applicable to a play context, in resolver order: Global, then campaign,
+/// chapter and scene cues, each by position. Items are loaded in a second query,
+/// not one query per cue.
+fn applicable_cues(conn: &Connection, context: &PlayContext) -> Result<Vec<Cue>> {
+    // NULL parameters match nothing, so an absent campaign/chapter/scene adds no cues.
+    let scope = params![context.campaign_id, context.chapter_id, context.scene_id];
+    let mut cues = query_all(
+        conn,
+        &format!(
+            "SELECT {CUE_COLS} FROM cues WHERE {APPLICABLE_CUES_WHERE} \
+             ORDER BY CASE owner_level WHEN 'global' THEN 0 WHEN 'campaign' THEN 1 \
+             WHEN 'chapter' THEN 2 ELSE 3 END, position, id"
+        ),
+        scope,
+        cue_from_row,
+    )?;
+    let items = query_all(
+        conn,
+        &format!(
+            "SELECT {ITEM_COLS} FROM cue_items WHERE cue_id IN \
+             (SELECT id FROM cues WHERE {APPLICABLE_CUES_WHERE}) ORDER BY cue_id, position, id"
+        ),
+        scope,
+        cue_item_from_row,
+    )?;
+    let mut by_cue: HashMap<Id, Vec<CueItem>> = HashMap::new();
+    for item in items {
+        by_cue.entry(item.cue_id).or_default().push(item);
+    }
+    for cue in &mut cues {
+        cue.items = by_cue.remove(&cue.id).unwrap_or_default();
+    }
+    Ok(cues)
 }
 
 fn list_ambience_on(conn: &Connection, environment_id: Option<Id>) -> Result<Vec<AmbienceTrack>> {
@@ -1577,6 +1668,173 @@ mod tests {
         assert!(is_not_found(
             lib.resolver_input(PlayContext { campaign_id: None, chapter_id: None, scene_id: Some(9999) })
         ));
+    }
+
+    #[test]
+    fn tag_kinds_are_enforced_on_cues_and_ambience() {
+        let lib = lib();
+        let combat = tag_id(&lib, TagKind::Situation, "Combat");
+        let tension = tag_id(&lib, TagKind::Emotion, "Tension");
+        let env = env_id(&lib, "Cave");
+        let opts = CueOptions::default();
+
+        // create_cue: situation must be a situation, emotion an emotion.
+        match lib.create_cue(CueOwner::Global, "x", Some(tension), None, &opts) {
+            Err(BardicError::Invalid(msg)) => assert_eq!(msg, format!("tag {tension} is not a situation")),
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+        match lib.create_cue(CueOwner::Global, "x", None, Some(combat), &opts) {
+            Err(BardicError::Invalid(msg)) => assert_eq!(msg, format!("tag {combat} is not an emotion")),
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+        assert!(is_not_found(lib.create_cue(CueOwner::Global, "x", Some(9999), None, &opts)));
+        assert!(is_not_found(lib.create_cue(CueOwner::Global, "x", None, Some(9999), &opts)));
+        assert_eq!(count(&lib, "cues"), 0);
+
+        // update_cue: same rules, and the stored cue is left alone.
+        let cue = lib
+            .create_cue(CueOwner::Global, "ok", Some(combat), Some(tension), &opts)
+            .unwrap();
+        let mut bad = cue.clone();
+        bad.situation_id = Some(tension);
+        assert!(matches!(lib.update_cue(&bad), Err(BardicError::Invalid(_))));
+        let mut bad = cue.clone();
+        bad.emotion_id = Some(combat);
+        assert!(matches!(lib.update_cue(&bad), Err(BardicError::Invalid(_))));
+        let mut bad = cue.clone();
+        bad.emotion_id = Some(9999);
+        assert!(is_not_found(lib.update_cue(&bad)));
+        assert_eq!(lib.get_cue(cue.id).unwrap(), cue);
+
+        // add_ambience_track: emotion must be an emotion.
+        assert!(matches!(
+            lib.add_ambience_track(env, &track("spotify:track:k"), Some(combat)),
+            Err(BardicError::Invalid(_))
+        ));
+        assert!(is_not_found(lib.add_ambience_track(env, &track("spotify:track:k"), Some(9999))));
+        assert!(lib.list_ambience_tracks(Some(env)).unwrap().is_empty());
+        let ok = lib.add_ambience_track(env, &track("spotify:track:k"), Some(tension)).unwrap();
+        assert_eq!(ok.emotion_id, Some(tension));
+    }
+
+    #[test]
+    fn foreign_key_violations_map_to_invalid() {
+        let lib = lib();
+        assert!(matches!(
+            lib.add_cue_item(9999, &track("spotify:track:orphan")),
+            Err(BardicError::Invalid(msg)) if msg == "referenced item does not exist"
+        ));
+    }
+
+    #[test]
+    fn delete_tag_drops_single_tag_cues_and_clears_the_rest() {
+        let lib = lib();
+        let combat = tag_id(&lib, TagKind::Situation, "Combat");
+        let tavern = tag_id(&lib, TagKind::Situation, "Tavern");
+        let dread = tag_id(&lib, TagKind::Emotion, "Dread");
+        let opts = CueOptions::default();
+
+        // Only Combat: deleting Combat must delete this cue.
+        let only_combat = lib.create_cue(CueOwner::Global, "only", Some(combat), None, &opts).unwrap();
+        lib.add_cue_item(only_combat.id, &track("spotify:track:gone")).unwrap();
+        // Combat + Dread: deleting Combat leaves a Dread-only cue.
+        let combat_dread = lib
+            .create_cue(CueOwner::Global, "fight", Some(combat), Some(dread), &opts)
+            .unwrap();
+        // Tavern + Dread: unaffected by deleting Combat.
+        let tavern_dread = lib
+            .create_cue(CueOwner::Campaign(lib.create_campaign("C", "").unwrap().id), "tav", Some(tavern), Some(dread), &opts)
+            .unwrap();
+        let env = env_id(&lib, "Cave");
+        let track_row = lib.add_ambience_track(env, &track("spotify:track:mood"), Some(dread)).unwrap();
+
+        lib.delete_tag(combat).unwrap();
+        assert!(is_not_found(lib.get_cue(only_combat.id)));
+        assert_eq!(count(&lib, "cue_items"), 0, "items of a deleted cue go with it");
+        let kept = lib.get_cue(combat_dread.id).unwrap();
+        assert_eq!((kept.situation_id, kept.emotion_id), (None, Some(dread)));
+        assert_eq!(lib.get_cue(tavern_dread.id).unwrap().situation_id, Some(tavern));
+        assert!(is_not_found(lib.delete_tag(combat)));
+
+        // Deleting Dread: the Dread-only cue (formerly Combat+Dread) goes, the Tavern+Dread cue keeps Tavern.
+        lib.delete_tag(dread).unwrap();
+        assert!(is_not_found(lib.get_cue(combat_dread.id)));
+        let tav = lib.get_cue(tavern_dread.id).unwrap();
+        assert_eq!((tav.situation_id, tav.emotion_id), (Some(tavern), None));
+        let amb = lib.list_ambience_tracks(Some(env)).unwrap();
+        assert_eq!(amb, vec![AmbienceTrack { emotion_id: None, ..track_row }]);
+    }
+
+    #[test]
+    fn resolver_input_orders_items_within_each_cue() {
+        let lib = lib();
+        let campaign = lib.create_campaign("C", "").unwrap();
+        let chapter = lib.create_chapter(campaign.id, "Ch", "").unwrap();
+        let scene = lib.create_scene(chapter.id, "S", "").unwrap();
+        let opts = CueOptions::default();
+
+        let g1 = lib.create_cue(CueOwner::Global, "g1", None, None, &opts).unwrap();
+        let g2 = lib.create_cue(CueOwner::Global, "g2", None, None, &opts).unwrap();
+        let g_empty = lib.create_cue(CueOwner::Global, "empty", None, None, &opts).unwrap();
+        let cp = lib.create_cue(CueOwner::Campaign(campaign.id), "cp", None, None, &opts).unwrap();
+        let ch = lib.create_cue(CueOwner::Chapter(chapter.id), "ch", None, None, &opts).unwrap();
+        let sc = lib.create_cue(CueOwner::Scene(scene.id), "sc", None, None, &opts).unwrap();
+        let g_late = lib.create_cue(CueOwner::Global, "g_late", None, None, &opts).unwrap();
+        // Cues of another campaign must not be picked up.
+        let other_campaign = lib.create_campaign("Other", "").unwrap();
+        lib.create_cue(CueOwner::Campaign(other_campaign.id), "elsewhere", None, None, &opts).unwrap();
+
+        // Interleave items across cues, and reverse g2's order so position differs from id.
+        let mut g2_ids = Vec::new();
+        for cue in [&g1, &g2, &cp, &ch, &sc] {
+            for n in 0..3 {
+                let item = lib.add_cue_item(cue.id, &track(&format!("spotify:track:{}-{n}", cue.id))).unwrap();
+                if cue.id == g2.id {
+                    g2_ids.push(item.id);
+                }
+            }
+        }
+        g2_ids.reverse();
+        lib.reorder_cue_items(g2.id, &g2_ids).unwrap();
+
+        let input = lib
+            .resolver_input(PlayContext {
+                campaign_id: Some(campaign.id),
+                chapter_id: Some(chapter.id),
+                scene_id: Some(scene.id),
+            })
+            .unwrap();
+        let order: Vec<Id> = input.cues.iter().map(|c| c.id).collect();
+        assert_eq!(order, vec![g1.id, g2.id, g_empty.id, g_late.id, cp.id, ch.id, sc.id]);
+        for cue in &input.cues {
+            assert_eq!(cue.items, lib.get_cue(cue.id).unwrap().items, "cue {} items", cue.name);
+        }
+        let g2_loaded = input.cues.iter().find(|c| c.id == g2.id).unwrap();
+        assert_eq!(g2_loaded.items.iter().map(|i| i.id).collect::<Vec<_>>(), g2_ids);
+        assert!(input.cues.iter().find(|c| c.id == g_empty.id).unwrap().items.is_empty());
+        assert_eq!(input.cues.iter().find(|c| c.id == sc.id).unwrap().items.len(), 3);
+    }
+
+    #[test]
+    fn environments_with_tracks_lists_only_environments_with_spotify_tracks() {
+        let lib = lib();
+        assert!(lib.environments_with_tracks().unwrap().is_empty());
+
+        let cave = env_id(&lib, "Cave");
+        let forest = env_id(&lib, "Forest");
+        let sea = env_id(&lib, "Sea");
+        lib.add_ambience_track(cave, &track("spotify:track:c1"), None).unwrap();
+        lib.add_ambience_track(cave, &track("spotify:track:c2"), None).unwrap();
+        lib.add_ambience_track(forest, &track("spotify:track:f1"), None).unwrap();
+        // Local layers are not Spotify tracks.
+        lib.add_ambience_layer(sea, "Waves", "/waves.ogg", 0.5).unwrap();
+
+        // Ordered by environment position: Forest (0) before Cave (1).
+        assert_eq!(lib.environments_with_tracks().unwrap(), vec![forest, cave]);
+
+        let f = lib.list_ambience_tracks(Some(forest)).unwrap().remove(0);
+        lib.remove_ambience_track(f.id).unwrap();
+        assert_eq!(lib.environments_with_tracks().unwrap(), vec![cave]);
     }
 
     #[test]
